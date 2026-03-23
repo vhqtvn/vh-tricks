@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+. $(dirname $0)/../.include.sh
+export NVM_DIR="$HOME/.nvm"
+. "$NVM_DIR/nvm.sh" --no-use
+if command -v node >/dev/null 2>&1; then
+    LOADER_JS="$(grep -F '###''loader-js:' "$0" | sed 's/###''loader-js: //' | base64 --wrap=0)"
+    MAIN_JS="$(node --loader="data:text/javascript;base64,$LOADER_JS" "$@" "$0" 2>/dev/null)"
+    OVERRIDE_NPM_PREFIX=
+    case "$MAIN_JS" in
+        # use custom nvmrc for special paths
+        file://$HOME/.npm-global/*)
+            NVMRC_FILE="$HOME/.npm-global/.nvmrc"
+            OVERRIDE_NPM_PREFIX="$HOME/.npm-global"
+            ;;
+        *)
+            NVMRC_FILE="$(nvm_find_nvmrc)"
+            ;;
+    esac
+
+    if [ -n "$NVMRC_FILE" ]; then
+        NVM_VERSION="$(nvm version "$(cat "$NVMRC_FILE")")"
+        if [ "$NVM_VERSION" = "N/A" ]; then
+            nvm install "$(cat "$NVMRC_FILE")"
+        fi
+
+        nvm use "$(cat "$NVMRC_FILE")"
+    else
+        nvm use default
+    fi
+    if [ -n "$OVERRIDE_NPM_PREFIX" ]; then
+        export npm_config_prefix="$OVERRIDE_NPM_PREFIX"
+    fi
+fi
+
+exec "$(basename $0)" "$@"
+
+
+###loader-js: export function load(url, context, defaultLoad) {
+###loader-js:     console.log(url);
+###loader-js:     process.exit(0);
+###loader-js: }

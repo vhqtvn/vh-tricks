@@ -1,0 +1,28 @@
+#!/bin/bash
+mkdir -p ~/.npm-global
+[ -f ~/.npm-global/.nvmrc ] || echo "lts/*" > ~/.npm-global/.nvmrc
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" --no-use
+pushd ~/.npm-global > /dev/null
+nvm install > /dev/null 2>&1 && nvm use > /dev/null 2>&1
+popd > /dev/null
+
+case "$1" in
+  vhexec)
+    shift
+    exec node "$@"
+    ;;
+  vhpatch)
+    for script in ~/.npm-global/bin/*; do
+      [ -e "$script" ] || continue
+      target=$(readlink -f "$script")
+      [ -f "$target" ] && [ -x "$target" ] || continue
+      sed -i '1s|^#!/.*|#!/usr/bin/env -S '"$0"' vhexec|' "$target"
+    done
+    ;;
+  *)
+    [[ "$*" =~ (^| )(-g|--global)( |$) ]] || set -- "$1" -g "${@:2}"
+    export npm_config_prefix="$HOME/.npm-global"
+    npm "$@"
+    ;;
+esac
