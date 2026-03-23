@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/vhqtvn/vh-tricks/master}"
+REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/vhqtvn/vh-tricks/main}"
 BASE="$REPO_RAW/nvm/global/files"
 WRAPPER_DIR="$HOME/.local/bin/once-wrapper/node"
 BIN_DIR="$HOME/.local/bin"

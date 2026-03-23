@@ -18,10 +18,10 @@ Wraps `node`, `npm`, `pnpm`, `yarn` to automatically switch node versions based 
 
 **Install:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vhqtvn/vh-tricks/master/nvm/global/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/vhqtvn/vh-tricks/main/nvm/global/install.sh | bash
 ```
 
 **Uninstall:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vhqtvn/vh-tricks/master/nvm/global/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/vhqtvn/vh-tricks/main/nvm/global/install.sh | bash -s -- --uninstall
 ```
