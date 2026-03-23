@@ -32,6 +32,12 @@ if [ ! -s "$HOME/.nvm/nvm.sh" ]; then
   exit 1
 fi
 
+# require node of any version
+if ! command -v node &>/dev/null; then
+  echo "node not found. This setup temporary need a global node version"
+  exit 1
+fi
+
 # Download files
 mkdir -p "$WRAPPER_DIR"
 curl -fsSL "$BASE/once-wrapper/.include.sh" -o "$HOME/.local/bin/once-wrapper/.include.sh"
