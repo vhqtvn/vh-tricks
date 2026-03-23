@@ -11,7 +11,7 @@ MARKER_END="# <<< vh-tricks: nvm/global <<<"
 remove_rc_block() {
   for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
     [ -f "$rc" ] || continue
-    sed -i "/$MARKER_BEGIN/,/$MARKER_END/d" "$rc"
+    sed -i "\|$MARKER_BEGIN|,\|$MARKER_END|d" "$rc"
   done
 }
 
