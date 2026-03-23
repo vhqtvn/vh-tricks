@@ -2,9 +2,16 @@
 . $(dirname $0)/../.include.sh
 export NVM_DIR="$HOME/.nvm"
 . "$NVM_DIR/nvm.sh" --no-use
+LOADER_JS="$(grep -F '###''loader-js:' "$0" | sed 's/###''loader-js: //' | base64 --wrap=0)"
 if command -v node >/dev/null 2>&1; then
-    LOADER_JS="$(grep -F '###''loader-js:' "$0" | sed 's/###''loader-js: //' | base64 --wrap=0)"
     MAIN_JS="$(node --loader="data:text/javascript;base64,$LOADER_JS" "$@" "$0" 2>/dev/null)"
+elif NVM_DEFAULT="$(nvm version default 2>/dev/null)" && [ "$NVM_DEFAULT" != "N/A" ]; then
+    MAIN_JS="$(nvm exec default -- node --loader="data:text/javascript;base64,$LOADER_JS" "$@" "$0" 2>/dev/null)"
+else
+    echo "[vh-tricks] Warning: no node found and no nvm default set. Run 'nvm install --lts' to fix." >&2
+    MAIN_JS=
+fi
+{
     OVERRIDE_NPM_PREFIX=
     case "$MAIN_JS" in
         # use custom nvmrc for special paths
@@ -23,14 +30,14 @@ if command -v node >/dev/null 2>&1; then
             nvm install "$(cat "$NVMRC_FILE")"
         fi
 
-        nvm use "$(cat "$NVMRC_FILE")"
+        nvm use "$(cat "$NVMRC_FILE")" >&2
     else
-        nvm use default
+        nvm use default >&2
     fi
     if [ -n "$OVERRIDE_NPM_PREFIX" ]; then
         export npm_config_prefix="$OVERRIDE_NPM_PREFIX"
     fi
-fi
+}
 
 exec "$(basename $0)" "$@"
 

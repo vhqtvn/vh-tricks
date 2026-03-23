@@ -16,7 +16,7 @@ remove_rc_block() {
 }
 
 if [ "$1" = "--uninstall" ]; then
-  rm -f "$WRAPPER_DIR/node" "$WRAPPER_DIR/npm" "$WRAPPER_DIR/pnpm" "$WRAPPER_DIR/yarn"
+  rm -f "$WRAPPER_DIR/node" "$WRAPPER_DIR/npm" "$WRAPPER_DIR/yarn"
   rm -f "$HOME/.local/bin/once-wrapper/.include.sh"
   rmdir "$WRAPPER_DIR" 2>/dev/null || true
   rmdir "$HOME/.local/bin/once-wrapper" 2>/dev/null || true
@@ -32,12 +32,6 @@ if [ ! -s "$HOME/.nvm/nvm.sh" ]; then
   exit 1
 fi
 
-# require node of any version
-if ! command -v node &>/dev/null; then
-  echo "node not found. This setup temporary need a global node version"
-  exit 1
-fi
-
 # Download files
 mkdir -p "$WRAPPER_DIR"
 curl -fsSL "$BASE/once-wrapper/.include.sh" -o "$HOME/.local/bin/once-wrapper/.include.sh"
@@ -46,7 +40,7 @@ curl -fsSL "$BASE/npm-global" -o "$BIN_DIR/npm-global"
 
 # Permissions and symlinks
 chmod +x "$WRAPPER_DIR/node" "$BIN_DIR/npm-global"
-for cmd in npm pnpm yarn; do
+for cmd in npm yarn; do
   ln -sf node "$WRAPPER_DIR/$cmd"
 done
 
