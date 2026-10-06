@@ -24,12 +24,20 @@ curl -fsSL https://raw.githubusercontent.com/vhqtvn/vh-tricks/main/claude/multi/
 ```
 
 Configure at install time with env vars (persisted to
-`~/.config/claude-multi/config` and **reused on later updates / reinstalls**):
+`~/.config/claude-multi/config` and **reused on later updates / reinstalls**).
+Put the variables on the `bash` side of the pipe — with `curl ... | bash` the
+piped `bash` is a separate process and would not inherit vars set on `curl`:
 
 ```bash
-CLAUDE_MULTI_PROFILES="work personal alt" \
-CLAUDE_MULTI_SHARED="projects" \
-  curl -fsSL .../claude/multi/install.sh | bash
+curl -fsSL .../claude/multi/install.sh \
+  | CLAUDE_MULTI_PROFILES="work personal alt" CLAUDE_MULTI_SHARED="projects" bash
+```
+
+Or export them first (an exported var is inherited by the piped `bash`):
+
+```bash
+export CLAUDE_MULTI_PROFILES="work personal alt"
+curl -fsSL .../claude/multi/install.sh | bash
 ```
 
 **Uninstall** (keeps state + config so a reinstall reuses them):
