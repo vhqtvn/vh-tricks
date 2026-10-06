@@ -126,6 +126,24 @@ Result inside the sandbox:
   future version adds one, just add its name to `CLAUDE_MULTI_SHARED` — no code
   change needed.
 
+### Recipe: share sessions with your main (non-sandboxed) Claude
+
+To also share history with the normal `claude` you run outside the sandbox,
+point the shared store at your real `~/.claude/projects`. bwrap resolves the
+bind source through the symlink, so all profiles **and** main read/write the
+same transcripts:
+
+```bash
+# merge any profile-created sessions into main first (optional, non-clobbering):
+cp -an ~/.local/share/claude-multi/shared/projects/. ~/.claude/projects/ 2>/dev/null || true
+rm -rf ~/.local/share/claude-multi/shared/projects
+ln -s ~/.claude/projects ~/.local/share/claude-multi/shared/projects
+```
+
+Your main account becomes just another participant in the shared history
+(transcripts are account-agnostic, so resume works across all of them).
+`--purge`/`rm -rf` removes the symlink, not the real directory.
+
 ## Usage
 
 Select a profile by calling its wrapper (what **Paseo** should invoke):
