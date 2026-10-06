@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+#
+# claude-multi — run multiple Claude Code accounts on one machine with
+# isolated auth/identity but SHARED, resumable session history.
+#
+# Each profile gets a private ~/.claude + ~/.claude.json (creds, settings,
+# history). Selected subdirectories (default: projects) are then overlaid
+# with bind mounts pointing at common shared storage, so a session created
+# under profile A can be resumed under profile B.
+#
+# Isolation is done with bwrap bind mounts over the real canonical paths —
+# NO symlinks, NO CLAUDE_CONFIG_DIR, NO sandbox-HOME swap. Claude sees its
+# normal ~/.claude and ~/.claude.json.
+#
+# This file is installed by claude/multi/install.sh and is also usable
+# standalone (it falls back to sensible defaults when no config is present).
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Config (persisted by install.sh, reused on update / reinstall)
+# ---------------------------------------------------------------------------
+: "${XDG_DATA_HOME:=$HOME/.local/share}"
+: "${XDG_CONFIG_HOME:=$HOME/.config}"
+
+CONFIG_FILE="$XDG_CONFIG_HOME/claude-multi/config"
+# shellcheck disable=SC1090
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# Root of all multi-account state.
+: "${CLAUDE_MULTI_ROOT:=$XDG_DATA_HOME/claude-multi}"
+# Space-separated list of ~/.claude subdirectories to share across profiles.
+# Default is conservative: only resumable transcripts. You may add e.g.
+# "projects file-history session-env" for higher-fidelity cross-account resume.
+: "${CLAUDE_MULTI_SHARED:=projects}"
+# Give each profile a private, disposable ~/.cache (1=on, 0=off).
+: "${CLAUDE_MULTI_CACHE:=1}"
+# Extra host paths to expose writable (space-separated, bound to themselves).
+# e.g. CLAUDE_MULTI_WRITABLE="$HOME/.npm $HOME/.cargo"
+: "${CLAUDE_MULTI_WRITABLE:=}"
+# Expose $XDG_RUNTIME_DIR writable (ssh-agent / keyring sockets). 1=on, 0=off.
+: "${CLAUDE_MULTI_RUNTIME_DIR:=1}"
+# Name of the claude binary to launch inside the sandbox.
+: "${CLAUDE_MULTI_BIN:=claude}"
+
+PROFILES_DIR="$CLAUDE_MULTI_ROOT/profiles"
+SHARED_DIR="$CLAUDE_MULTI_ROOT/shared"
+LOCK_DIR="$SHARED_DIR/.locks"
+
+# Runtime-coordination dirs that must NEVER be shared or imported into a
+# private profile (they are PID/host/daemon scoped).
+RUNTIME_DIRS="sessions jobs daemon ide"
+
+err()  { printf '[claude-multi] %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+require_bwrap() {
+  command -v bwrap >/dev/null 2>&1 || die "bwrap (bubblewrap) not found. Install it (e.g. 'pacman -S bubblewrap' / 'apt install bubblewrap')."
+}
+
+valid_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_.-]*) return 1 ;;
+    .|..) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Profile creation / migration
+# ---------------------------------------------------------------------------
+ensure_shared() {
+  mkdir -p "$SHARED_DIR"
+  chmod 700 "$SHARED_DIR" 2>/dev/null || true
+  local n
+  for n in $CLAUDE_MULTI_SHARED; do
+    valid_name "$n" || die "invalid shared subdir name: '$n'"
+    case " $RUNTIME_DIRS " in
+      *" $n "*) err "WARNING: sharing runtime dir '$n' is unsafe and may corrupt state." ;;
+    esac
+    mkdir -p "$SHARED_DIR/$n"
+    chmod 700 "$SHARED_DIR/$n" 2>/dev/null || true
+  done
+}
+
+init_profile() {
+  local name="$1"
+  valid_name "$name" || die "invalid profile name: '$name'"
+  local p="$PROFILES_DIR/$name"
+  mkdir -p "$p/.claude"
+  chmod 700 "$p" "$p/.claude" 2>/dev/null || true
+  if [ ! -e "$p/.claude.json" ]; then
+    printf '{}' > "$p/.claude.json"
+    chmod 600 "$p/.claude.json" 2>/dev/null || true
+  fi
+  if [ "$CLAUDE_MULTI_CACHE" = "1" ]; then
+    mkdir -p "$p/cache"
+    chmod 700 "$p/cache" 2>/dev/null || true
+  fi
+  ensure_shared
+  echo "Initialized profile '$name' at $p"
+}
+
+import_profile() {
+  local name="" from="$HOME" force=0 seed=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) from="${2:-}"; shift 2 ;;
+      --from=*) from="${1#--from=}"; shift ;;
+      --force) force=1; shift ;;
+      --seed-shared) seed=1; shift ;;
+      --*) die "unknown import option: $1" ;;
+      *) [ -z "$name" ] && name="$1" || die "unexpected argument: $1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: claude-multi import <profile> [--from DIR] [--force] [--seed-shared]"
+  valid_name "$name" || die "invalid profile name: '$name'"
+  [ -d "$from/.claude" ] || die "no .claude found under '$from'"
+
+  init_profile "$name" >/dev/null
+  local p="$PROFILES_DIR/$name"
+
+  if [ -s "$p/.claude/.credentials.json" ] && [ "$force" != 1 ]; then
+    die "profile '$name' already has credentials. Re-run with --force to overwrite."
+  fi
+
+  echo "Importing from $from/.claude -> $p/.claude (private state only)"
+  # Copy everything, then prune shared + runtime dirs out of the private copy.
+  cp -a "$from/.claude/." "$p/.claude/" 2>/dev/null || true
+  local ex
+  for ex in $CLAUDE_MULTI_SHARED $RUNTIME_DIRS; do
+    rm -rf "${p:?}/.claude/$ex"
+  done
+  if [ -f "$from/.claude.json" ]; then
+    cp -a "$from/.claude.json" "$p/.claude.json"
+    chmod 600 "$p/.claude.json" 2>/dev/null || true
+  fi
+  chmod -R u+rwX,go-rwx "$p/.claude" 2>/dev/null || true
+
+  if [ "$seed" = 1 ]; then
+    local n
+    for n in $CLAUDE_MULTI_SHARED; do
+      if [ -d "$from/.claude/$n" ] && [ -z "$(ls -A "$SHARED_DIR/$n" 2>/dev/null)" ]; then
+        echo "Seeding shared '$n' from $from/.claude/$n"
+        cp -a "$from/.claude/$n/." "$SHARED_DIR/$n/" 2>/dev/null || true
+      fi
+    done
+  fi
+  echo "Done. Private creds/settings imported; shared dirs ($CLAUDE_MULTI_SHARED) left to the shared store."
+}
+
+# ---------------------------------------------------------------------------
+# Sandbox launch
+# ---------------------------------------------------------------------------
+# Detect an explicit --resume/-r <uuid> so we can guard against two profiles
+# attaching to the same session concurrently. Best-effort; only exact UUIDs.
+detect_resume_uuid() {
+  local prev="" a
+  for a in "$@"; do
+    case "$prev" in --resume|-r) printf '%s' "$a"; return ;; esac
+    case "$a" in
+      --resume=*) printf '%s' "${a#--resume=}"; return ;;
+    esac
+    prev="$a"
+  done
+}
+
+# launch_in <profile> <command> [args...]
+launch_in() {
+  local name="$1"; shift
+  valid_name "$name" || die "invalid profile name: '$name'"
+  local p="$PROFILES_DIR/$name"
+  [ -d "$p/.claude" ] || die "profile '$name' not initialized. Run: claude-multi init $name  (or: import $name)"
+  [ -e "$p/.claude.json" ] || printf '{}' > "$p/.claude.json"
+  require_bwrap
+  ensure_shared
+
+  local args=(
+    --ro-bind / /
+    --proc /proc
+    --dev /dev
+    --tmpfs /tmp
+    # Private account state first...
+    --bind "$p/.claude"      "$HOME/.claude"
+    --bind "$p/.claude.json" "$HOME/.claude.json"
+  )
+  # ...then overlay shared subdirs ON TOP of the private .claude.
+  local n
+  for n in $CLAUDE_MULTI_SHARED; do
+    args+=( --bind "$SHARED_DIR/$n" "$HOME/.claude/$n" )
+  done
+  # Profile-local disposable cache.
+  if [ "$CLAUDE_MULTI_CACHE" = "1" ]; then
+    mkdir -p "$p/cache"
+    args+=( --bind "$p/cache" "$HOME/.cache" )
+  fi
+  # Extra writable passthroughs.
+  local w
+  for w in $CLAUDE_MULTI_WRITABLE; do
+    [ -e "$w" ] && args+=( --bind "$w" "$w" )
+  done
+  # ssh-agent / keyring sockets.
+  if [ "$CLAUDE_MULTI_RUNTIME_DIR" = "1" ] && [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+    args+=( --bind "$XDG_RUNTIME_DIR" "$XDG_RUNTIME_DIR" )
+  fi
+  # Writable working tree.
+  args+=( --bind "$PWD" "$PWD" )
+
+  args+=(
+    --die-with-parent
+    --setenv TMPDIR /tmp
+    --unsetenv ANTHROPIC_API_KEY
+    --unsetenv ANTHROPIC_AUTH_TOKEN
+    --unsetenv CLAUDE_CODE_OAUTH_TOKEN
+    --unsetenv ANTHROPIC_BASE_URL
+    --unsetenv CLAUDE_CODE_USE_BEDROCK
+    --unsetenv CLAUDE_CODE_USE_VERTEX
+    --unsetenv CLAUDE_CODE_USE_FOUNDRY
+  )
+
+  exec bwrap "${args[@]}" "$@"
+}
+
+run_profile() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: claude-multi run <profile> [claude args...]"
+  shift
+  local uuid; uuid="$(detect_resume_uuid "$@")"
+  if [ -n "$uuid" ]; then
+    mkdir -p "$LOCK_DIR"; chmod 700 "$LOCK_DIR" 2>/dev/null || true
+    # Hold the lock for the lifetime of the launched process (fd stays open
+    # across exec). Best-effort guard against concurrent same-UUID resume.
+    exec 9>"$LOCK_DIR/$uuid.lock"
+    if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+      die "session $uuid is already attached in another profile/process. Refusing concurrent resume."
+    fi
+  fi
+  launch_in "$name" "$CLAUDE_MULTI_BIN" "$@"
+}
+
+# exec_profile <profile> -- <command...>   (run an arbitrary command sandboxed)
+exec_profile() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: claude-multi exec <profile> -- <command...>"
+  shift
+  [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || die "no command given"
+  launch_in "$name" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Info / verification
+# ---------------------------------------------------------------------------
+list_profiles() {
+  echo "Root:    $CLAUDE_MULTI_ROOT"
+  echo "Shared:  $CLAUDE_MULTI_SHARED"
+  echo "Config:  ${CLAUDE_MULTI_PROFILES:-<none persisted>}"
+  echo "Profiles:"
+  if [ -d "$PROFILES_DIR" ]; then
+    local d name loggedin
+    for d in "$PROFILES_DIR"/*/; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      if [ -s "$d/.claude/.credentials.json" ]; then loggedin="logged in"; else loggedin="not logged in"; fi
+      printf '  - %-16s %s\n' "$name" "$loggedin"
+    done
+  else
+    echo "  (none)"
+  fi
+}
+
+verify() {
+  require_bwrap
+  set +e  # we intentionally run commands expected to fail
+  local tmproot; tmproot="$(mktemp -d "${TMPDIR:-/tmp}/claude-multi-verify.XXXXXX")"
+  CLAUDE_MULTI_ROOT="$tmproot"
+  PROFILES_DIR="$CLAUDE_MULTI_ROOT/profiles"
+  SHARED_DIR="$CLAUDE_MULTI_ROOT/shared"
+  CLAUDE_MULTI_SHARED="projects"
+  CLAUDE_MULTI_CACHE=1
+
+  init_profile a >/dev/null
+  init_profile b >/dev/null
+  echo "A-only" > "$PROFILES_DIR/a/.claude/MARKER-A"
+  echo "B-only" > "$PROFILES_DIR/b/.claude/MARKER-B"
+  echo "shared" > "$SHARED_DIR/projects/MARKER-SHARED"
+
+  local fail=0
+  # Run the test command in a SUBSHELL so launch_in's `exec bwrap` replaces the
+  # subshell, not this script.
+  expect_ok()   { if ( launch_in "$2" bash -c "$3" ) >/dev/null 2>&1; then printf '  PASS  %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fail=1; fi; }
+  expect_fail() { if ( launch_in "$2" bash -c "$3" ) >/dev/null 2>&1; then printf '  FAIL  %s\n' "$1"; fail=1; else printf '  PASS  %s\n' "$1"; fi; }
+
+  echo "Running sandbox verification (no login required):"
+  expect_ok   "1. A sees A-only marker"                  a '[ -f ~/.claude/MARKER-A ]'
+  expect_fail "2. A does NOT see B-only marker"          a '[ -f ~/.claude/MARKER-B ]'
+  expect_ok   "3. B sees B-only marker"                  b '[ -f ~/.claude/MARKER-B ]'
+  expect_fail "   B does NOT see A-only marker"          b '[ -f ~/.claude/MARKER-A ]'
+  expect_ok   "4a. A sees shared marker under projects"  a '[ -f ~/.claude/projects/MARKER-SHARED ]'
+  expect_ok   "4b. B sees shared marker under projects"  b '[ -f ~/.claude/projects/MARKER-SHARED ]'
+  expect_ok   "5. writes in project dir succeed"         a "touch '$PWD/.claude-multi-verify.tmp' && rm -f '$PWD/.claude-multi-verify.tmp'"
+  expect_fail "6. writes to / (host root) fail"          a 'touch /claude-multi-should-fail'
+  # Cross-account session visibility (proxy for test 8):
+  ( launch_in a bash -c 'echo hi > ~/.claude/projects/XSESSION.jsonl' ) >/dev/null 2>&1
+  expect_ok   "8*. projects file written by A is visible to B" b '[ -f ~/.claude/projects/XSESSION.jsonl ]'
+
+  rm -rf "$tmproot"
+  echo
+  if [ "$fail" = 0 ]; then echo "All sandbox checks PASSED."; else echo "Some checks FAILED."; fi
+  echo "Note: tests 7 (login isolation) and 8 (real session resume) require"
+  echo "      logging two profiles in; see claude/multi/README.md."
+  return $fail
+}
+
+usage() {
+  cat <<EOF
+claude-multi — multi-account Claude Code launcher (isolated auth, shared sessions)
+
+Usage:
+  claude-multi run <profile> [claude args...]   Launch Claude as <profile>
+  claude-multi exec <profile> -- <cmd...>       Run any command in the sandbox
+  claude-multi init <profile>                   Create empty profile state
+  claude-multi import <profile> [opts]          Copy existing ~/.claude into a profile
+       opts: --from DIR  --force  --seed-shared
+  claude-multi list                             Show profiles / login status
+  claude-multi verify                           Run sandbox isolation self-test
+  claude-multi where                            Print state paths
+  claude-multi help
+
+Config: $CONFIG_FILE
+Root:   $CLAUDE_MULTI_ROOT   Shared: $CLAUDE_MULTI_SHARED
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    run)     run_profile "$@" ;;
+    exec)    exec_profile "$@" ;;
+    init)    init_profile "${1:-}" ;;
+    import)  import_profile "$@" ;;
+    list|ls) list_profiles ;;
+    verify)  verify ;;
+    where|path)
+      echo "root=$CLAUDE_MULTI_ROOT"
+      echo "profiles=$PROFILES_DIR"
+      echo "shared=$SHARED_DIR"
+      echo "config=$CONFIG_FILE" ;;
+    help|-h|--help) usage ;;
+    *) err "unknown command: $cmd"; usage; exit 2 ;;
+  esac
+}
+
+main "$@"
