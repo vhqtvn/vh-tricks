@@ -183,6 +183,20 @@ import_profile() {
 # content is merged into main non-destructively (cp -an) before the shared dir
 # is replaced by a symlink, so nothing is lost.
 # ---------------------------------------------------------------------------
+# Print relative paths under $1 (shared dir) that would be LOST if $1 were
+# removed after `cp -an $1 $2` — i.e. files that collide with a DIFFERENT file
+# already in $2 (main). Files unique to shared copy cleanly and are not at risk.
+at_risk_files() {
+  local sdir="$1" mdir="$2" rel
+  [ -d "$sdir" ] || return 0
+  ( cd "$sdir" && find . -type f -print 2>/dev/null ) | while IFS= read -r rel; do
+    rel="${rel#./}"
+    if [ -e "$mdir/$rel" ] && ! cmp -s "$sdir/$rel" "$mdir/$rel"; then
+      printf '%s\n' "$rel"
+    fi
+  done
+}
+
 link_main() {
   local names=()
   while [ $# -gt 0 ]; do
@@ -196,8 +210,7 @@ link_main() {
   [ ${#names[@]} -eq 0 ] && names=($CLAUDE_MULTI_SHARED)
   ensure_shared
 
-  local do_link=() do_merge=() do_rm=()
-  local n link target
+  local do_link=() risky=() n link target r
   for n in "${names[@]}"; do
     valid_name "$n" || die "invalid subdir name: '$n'"
     link="$SHARED_DIR/$n"; target="$HOME/.claude/$n"
@@ -205,34 +218,29 @@ link_main() {
       echo "already linked: shared/$n -> $target"
       continue
     fi
-    if [ -L "$link" ]; then
-      do_rm+=("shared/$n  (symlink -> $(readlink "$link"))")
-    elif [ -d "$link" ]; then
-      [ -n "$(ls -A "$link" 2>/dev/null)" ] && do_merge+=("shared/$n")
-      do_rm+=("shared/$n  (directory)")
-    fi
     do_link+=("$n")
+    # Only a real directory with colliding, differing files risks data loss;
+    # a symlink is just a pointer, and unique files merge losslessly (cp -an).
+    if [ ! -L "$link" ] && [ -d "$link" ]; then
+      while IFS= read -r r; do [ -n "$r" ] && risky+=("$n/$r"); done < <(at_risk_files "$link" "$target")
+    fi
   done
 
   if [ ${#do_link[@]} -eq 0 ]; then echo "Nothing to do."; return 0; fi
 
-  echo "Plan — link shared subdirs to your main ~/.claude:"
-  for n in "${do_link[@]}"; do echo "  shared/$n  ->  $HOME/.claude/$n"; done
-  if [ ${#do_merge[@]} -gt 0 ]; then
-    echo "First merge existing content into main (non-destructive, cp -an):"
-    for n in "${do_merge[@]}"; do echo "  $n"; done
+  # Confirm ONLY if something would actually be lost.
+  if [ ${#risky[@]} -gt 0 ]; then
+    echo "WARNING: these shared files differ from an existing file in ~/.claude and"
+    echo "would be LOST (main's version is kept):"
+    for r in "${risky[@]}"; do echo "  shared/$r"; done
+    confirm "Link anyway, dropping the above?" || { echo "Aborted — nothing changed."; return 1; }
   fi
-  if [ ${#do_rm[@]} -gt 0 ]; then
-    echo "Then REMOVE (replaced by symlinks):"
-    for n in "${do_rm[@]}"; do echo "  $n"; done
-  fi
-  confirm "Proceed?" || { echo "Aborted — nothing changed."; return 1; }
 
   for n in "${do_link[@]}"; do
     link="$SHARED_DIR/$n"; target="$HOME/.claude/$n"
     mkdir -p "$target"
-    if [ -d "$link" ] && [ ! -L "$link" ] && [ -n "$(ls -A "$link" 2>/dev/null)" ]; then
-      cp -an "$link/." "$target/" 2>/dev/null || true
+    if [ ! -L "$link" ] && [ -d "$link" ] && [ -n "$(ls -A "$link" 2>/dev/null)" ]; then
+      cp -an "$link/." "$target/" 2>/dev/null || true   # non-destructive merge
     fi
     rm -rf "$link"
     ln -s "$target" "$link"
@@ -240,11 +248,12 @@ link_main() {
   done
 }
 
+# Detaching never loses data (it lives in main); no confirmation needed.
 unlink_main() {
   local names=() copy=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --yes|-y) CLAUDE_MULTI_YES=1; shift ;;
+      --yes|-y) shift ;;              # accepted, no-op (nothing to confirm)
       --copy)   copy=1; shift ;;
       --all)    names=($CLAUDE_MULTI_SHARED); shift ;;
       --*)      die "unknown unlink-main option: $1" ;;
@@ -253,21 +262,12 @@ unlink_main() {
   done
   [ ${#names[@]} -eq 0 ] && names=($CLAUDE_MULTI_SHARED)
 
-  local do_unlink=() n link
+  local n link target
   for n in "${names[@]}"; do
     valid_name "$n" || die "invalid subdir name: '$n'"
     link="$SHARED_DIR/$n"
-    if [ -L "$link" ]; then do_unlink+=("$n"); else echo "not linked (skipping): shared/$n"; fi
-  done
-  if [ ${#do_unlink[@]} -eq 0 ]; then echo "Nothing to do."; return 0; fi
-
-  echo "Plan — detach these shared subdirs from main (make them independent dirs again):"
-  for n in "${do_unlink[@]}"; do echo "  REMOVE symlink shared/$n  (was -> $(readlink "$SHARED_DIR/$n"))"; done
-  [ "$copy" = 1 ] && echo "Then copy main's current content back into each (cp -an)."
-  confirm "Proceed?" || { echo "Aborted — nothing changed."; return 1; }
-
-  for n in "${do_unlink[@]}"; do
-    link="$SHARED_DIR/$n"; local target; target="$(readlink -f "$link")"
+    if [ ! -L "$link" ]; then echo "not linked (skipping): shared/$n"; continue; fi
+    target="$(readlink -f "$link")"
     rm -f "$link"
     mkdir -p "$link"; chmod 700 "$link" 2>/dev/null || true
     if [ "$copy" = 1 ] && [ -d "$target" ]; then

@@ -143,12 +143,15 @@ claude-multi unlink-main            # detach again (independent dirs)
 claude-multi unlink-main --copy     # detach, keeping a snapshot of main's content
 ```
 
-`link-main` **always prints a plan and asks for confirmation before any
-removal**. Existing shared content is merged into main non-destructively
-(`cp -an`, never overwrites) before the shared dir is replaced by a symlink, so
-nothing is lost. It is idempotent (an already-correct link is left alone). Pass
-`--yes` (or `CLAUDE_MULTI_YES=1`) to auto-confirm in scripts; with no terminal
-and no `--yes` it refuses rather than guess.
+Existing shared content is merged into main non-destructively (`cp -an`, never
+overwrites) before the shared dir is replaced by a symlink. `link-main` only
+**asks for confirmation when something would actually be lost** — i.e. a shared
+file collides with a *different* existing file in `~/.claude` (main's copy is
+kept). Empty dirs, unique files, identical files, and re-linking are lossless
+and run without prompting. It is idempotent. Pass `--yes` (or
+`CLAUDE_MULTI_YES=1`) to auto-confirm in scripts; with a real collision, no
+terminal and no `--yes`, it refuses rather than guess. `unlink-main` never
+prompts (the data stays in main).
 
 Set it up **at install time** with `CLAUDE_MULTI_LINK_MAIN` (`projects`, a space
 list, or `all`); the installer runs `link-main` for you (prompting on your
