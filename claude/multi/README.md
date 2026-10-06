@@ -262,6 +262,51 @@ cd /some/project && claude-a      # create a session, note its UUID, exit
 claude-b --resume <that-uuid>     # continues under B
 ```
 
+## Migrating / upgrading
+
+### From an earlier version of this trick
+
+Just **re-run the installer** — it is non-destructive:
+
+```bash
+curl -fsSL .../claude/multi/install.sh | bash
+```
+
+It preserves all profile and shared state (credentials, settings, sessions),
+upgrades the config to the current format (older versions stored hard
+assignments that silently blocked env overrides — this fixes that), refreshes
+the `claude-multi` launcher (adding `link-main` etc.), and regenerates the
+per-profile wrappers. You can change settings in the same command; env vars win
+over the stored config:
+
+```bash
+curl -fsSL .../claude/multi/install.sh \
+  | CLAUDE_MULTI_PROFILES="a b c" CLAUDE_MULTI_SHARED="projects file-history" bash
+```
+
+Notes:
+- Wrappers are only *created*, never pruned. If you drop a profile from
+  `CLAUDE_MULTI_PROFILES`, delete its leftover `~/.local/bin/claude-<name>` by
+  hand (or `--purge` and reinstall). Its state under `profiles/<name>/` is kept
+  until you remove it.
+- If you had manually symlinked a shared dir to your main `~/.claude`, it keeps
+  working; `claude-multi link-main` is now the supported way to do the same.
+
+### From a different / older standalone bwrap launcher
+
+Install this trick, then import your existing Claude state into a profile
+(non-destructive — your real `~/.claude` is only read):
+
+```bash
+claude-multi import a --seed-shared      # copies creds/settings into profile a,
+                                         # seeds shared/projects once
+claude-multi link-main                   # (optional) also share with the main claude
+claude-a                                 # verify; /login only if needed
+```
+
+Then point your old launcher's entrypoints at the new `claude-<profile>`
+wrappers and retire the old script. Nothing in the old setup is modified.
+
 ## Caveats (Claude Code 2.1.291)
 
 - Only `projects/` is shared by default; `/rewind` checkpoints and per-session

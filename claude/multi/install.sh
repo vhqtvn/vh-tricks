@@ -21,10 +21,23 @@ remove_rc_block() {
 }
 
 # --- Load persisted config so updates / reinstalls reuse prior settings ----
+# Snapshot env-provided overrides FIRST so they win even over an old-format
+# (hard-assign) config left by an earlier version.
+CM_VARS="ROOT PROFILES SHARED CACHE WRITABLE RUNTIME_DIR LINK_MAIN"
+for _v in $CM_VARS; do
+  eval "_envset_$_v=\${CLAUDE_MULTI_$_v+set}"
+  eval "_envval_$_v=\${CLAUDE_MULTI_$_v-}"
+done
 if [ -f "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
   . "$CONFIG_FILE"
 fi
+# Re-apply any override that was present in the environment.
+for _v in $CM_VARS; do
+  if [ "$(eval echo "\${_envset_$_v}")" = set ]; then
+    eval "CLAUDE_MULTI_$_v=\${_envval_$_v}"
+  fi
+done
 : "${CLAUDE_MULTI_ROOT:=$XDG_DATA_HOME/claude-multi}"
 
 list_profile_wrappers() {
