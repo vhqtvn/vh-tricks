@@ -67,6 +67,9 @@ CLAUDE_MULTI_SHARED="${CLAUDE_MULTI_SHARED:-projects}"
 CLAUDE_MULTI_CACHE="${CLAUDE_MULTI_CACHE:-1}"
 CLAUDE_MULTI_WRITABLE="${CLAUDE_MULTI_WRITABLE:-}"
 CLAUDE_MULTI_RUNTIME_DIR="${CLAUDE_MULTI_RUNTIME_DIR:-1}"
+# Shared subdirs to symlink to the main (non-sandboxed) ~/.claude at setup:
+# a space list of names, or "all" for the whole shared set, or "" to skip.
+CLAUDE_MULTI_LINK_MAIN="${CLAUDE_MULTI_LINK_MAIN:-}"
 
 # ------------------------------- Persist config ----------------------------
 mkdir -p "$CONFIG_DIR"
@@ -84,6 +87,7 @@ cat > "$CONFIG_FILE" <<EOF
 : "\${CLAUDE_MULTI_CACHE:=$CLAUDE_MULTI_CACHE}"
 : "\${CLAUDE_MULTI_WRITABLE:=$CLAUDE_MULTI_WRITABLE}"
 : "\${CLAUDE_MULTI_RUNTIME_DIR:=$CLAUDE_MULTI_RUNTIME_DIR}"
+: "\${CLAUDE_MULTI_LINK_MAIN:=$CLAUDE_MULTI_LINK_MAIN}"
 EOF
 chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
@@ -117,6 +121,18 @@ for prof in $CLAUDE_MULTI_PROFILES; do
   case "$prof" in ''|*[!A-Za-z0-9_.-]*) continue ;; esac
   "$LAUNCHER" init "$prof" >/dev/null || true
 done
+
+# Optionally share selected subdirs with the main (non-sandboxed) ~/.claude.
+# link-main checks + confirms every removal itself (prompting on /dev/tty, which
+# works under `curl ... | bash`); set CLAUDE_MULTI_YES=1 to auto-confirm.
+if [ -n "$CLAUDE_MULTI_LINK_MAIN" ]; then
+  echo
+  echo "Setting up main-share (CLAUDE_MULTI_LINK_MAIN=\"$CLAUDE_MULTI_LINK_MAIN\")..."
+  case "$CLAUDE_MULTI_LINK_MAIN" in
+    all|1|yes|true) "$LAUNCHER" link-main --all ;;
+    *)              "$LAUNCHER" link-main $CLAUDE_MULTI_LINK_MAIN ;;
+  esac || echo "  (main-share skipped/aborted; run 'claude-multi link-main' later)"
+fi
 
 # ------------------------------- PATH on rc --------------------------------
 remove_rc_block

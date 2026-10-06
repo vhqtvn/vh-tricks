@@ -62,6 +62,9 @@ curl -fsSL .../claude/multi/install.sh | bash -s -- --purge
 | `CLAUDE_MULTI_CACHE` | `1` | Give each profile a private disposable `~/.cache` |
 | `CLAUDE_MULTI_WRITABLE` | *(empty)* | Extra host paths exposed writable, e.g. `"$HOME/.npm"` |
 | `CLAUDE_MULTI_RUNTIME_DIR` | `1` | Expose `$XDG_RUNTIME_DIR` (ssh-agent / keyring sockets) |
+| `CLAUDE_MULTI_LINK_MAIN` | *(empty)* | Subdirs to symlink to main `~/.claude` at install (`projects`, a list, or `all`) |
+
+Env vars override the stored config at runtime too, e.g. `CLAUDE_MULTI_SHARED="projects file-history" claude-a`.
 
 To change settings later: re-run the installer with new env vars (it rewrites
 the config), edit `~/.config/claude-multi/config` directly, or `--purge` and
@@ -126,23 +129,39 @@ Result inside the sandbox:
   future version adds one, just add its name to `CLAUDE_MULTI_SHARED` — no code
   change needed.
 
-### Recipe: share sessions with your main (non-sandboxed) Claude
+### Share sessions with your main (non-sandboxed) Claude
 
 To also share history with the normal `claude` you run outside the sandbox,
-point the shared store at your real `~/.claude/projects`. bwrap resolves the
+point the shared store at your real `~/.claude/<subdir>`. bwrap resolves the
 bind source through the symlink, so all profiles **and** main read/write the
-same transcripts:
+same transcripts. Use the built-in subcommand:
 
 ```bash
-# merge any profile-created sessions into main first (optional, non-clobbering):
-cp -an ~/.local/share/claude-multi/shared/projects/. ~/.claude/projects/ 2>/dev/null || true
-rm -rf ~/.local/share/claude-multi/shared/projects
-ln -s ~/.claude/projects ~/.local/share/claude-multi/shared/projects
+claude-multi link-main              # link the whole shared set (default: projects)
+claude-multi link-main projects     # or name specific subdirs
+claude-multi unlink-main            # detach again (independent dirs)
+claude-multi unlink-main --copy     # detach, keeping a snapshot of main's content
 ```
 
-Your main account becomes just another participant in the shared history
+`link-main` **always prints a plan and asks for confirmation before any
+removal**. Existing shared content is merged into main non-destructively
+(`cp -an`, never overwrites) before the shared dir is replaced by a symlink, so
+nothing is lost. It is idempotent (an already-correct link is left alone). Pass
+`--yes` (or `CLAUDE_MULTI_YES=1`) to auto-confirm in scripts; with no terminal
+and no `--yes` it refuses rather than guess.
+
+Set it up **at install time** with `CLAUDE_MULTI_LINK_MAIN` (`projects`, a space
+list, or `all`); the installer runs `link-main` for you (prompting on your
+terminal, which works through `curl … | bash`):
+
+```bash
+curl -fsSL .../claude/multi/install.sh \
+  | CLAUDE_MULTI_PROFILES="work personal" CLAUDE_MULTI_LINK_MAIN="projects" bash
+```
+
+Your main account then becomes just another participant in the shared history
 (transcripts are account-agnostic, so resume works across all of them).
-`--purge`/`rm -rf` removes the symlink, not the real directory.
+`--purge`/`rm -rf` removes the symlink, not the real `~/.claude` directory.
 
 ## Usage
 

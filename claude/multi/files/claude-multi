@@ -42,6 +42,8 @@ CONFIG_FILE="$XDG_CONFIG_HOME/claude-multi/config"
 : "${CLAUDE_MULTI_RUNTIME_DIR:=1}"
 # Name of the claude binary to launch inside the sandbox.
 : "${CLAUDE_MULTI_BIN:=claude}"
+# Auto-confirm destructive actions (used by install bootstrap / scripts).
+: "${CLAUDE_MULTI_YES:=0}"
 
 PROFILES_DIR="$CLAUDE_MULTI_ROOT/profiles"
 SHARED_DIR="$CLAUDE_MULTI_ROOT/shared"
@@ -56,6 +58,29 @@ die()  { err "$*"; exit 1; }
 
 require_bwrap() {
   command -v bwrap >/dev/null 2>&1 || die "bwrap (bubblewrap) not found. Install it (e.g. 'pacman -S bubblewrap' / 'apt install bubblewrap')."
+}
+
+# confirm "<question>" — returns 0 on yes. Honors CLAUDE_MULTI_YES=1; otherwise
+# prompts on the terminal (via /dev/tty so it works under `curl ... | bash`).
+# With no terminal and no CLAUDE_MULTI_YES, it refuses (safe default).
+confirm() {
+  if [ "$CLAUDE_MULTI_YES" = "1" ]; then
+    echo "$1 -> yes (CLAUDE_MULTI_YES=1)"
+    return 0
+  fi
+  local reply=""
+  if { exec 3<>/dev/tty; } 2>/dev/null; then
+    printf '%s [y/N] ' "$1" >&3
+    read -r reply <&3 || reply=""
+    exec 3>&- 3<&- 2>/dev/null || true
+  elif [ -t 0 ]; then
+    printf '%s [y/N] ' "$1"
+    read -r reply || reply=""
+  else
+    err "no terminal available to confirm. Re-run interactively or set CLAUDE_MULTI_YES=1."
+    return 1
+  fi
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
 valid_name() {
@@ -147,6 +172,109 @@ import_profile() {
     done
   fi
   echo "Done. Private creds/settings imported; shared dirs ($CLAUDE_MULTI_SHARED) left to the shared store."
+}
+
+# ---------------------------------------------------------------------------
+# Link shared subdirs to the main (non-sandboxed) ~/.claude so profiles AND the
+# normal `claude` share the same storage. bwrap resolves the symlinked bind
+# source on the host, so sessions resume across all of them.
+#
+# Every removal is reported and confirmed first (see confirm()). Existing
+# content is merged into main non-destructively (cp -an) before the shared dir
+# is replaced by a symlink, so nothing is lost.
+# ---------------------------------------------------------------------------
+link_main() {
+  local names=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) CLAUDE_MULTI_YES=1; shift ;;
+      --all)    names=($CLAUDE_MULTI_SHARED); shift ;;
+      --*)      die "unknown link-main option: $1" ;;
+      *)        names+=("$1"); shift ;;
+    esac
+  done
+  [ ${#names[@]} -eq 0 ] && names=($CLAUDE_MULTI_SHARED)
+  ensure_shared
+
+  local do_link=() do_merge=() do_rm=()
+  local n link target
+  for n in "${names[@]}"; do
+    valid_name "$n" || die "invalid subdir name: '$n'"
+    link="$SHARED_DIR/$n"; target="$HOME/.claude/$n"
+    if [ -L "$link" ] && [ "$(readlink -f "$link")" = "$(readlink -f "$target")" ]; then
+      echo "already linked: shared/$n -> $target"
+      continue
+    fi
+    if [ -L "$link" ]; then
+      do_rm+=("shared/$n  (symlink -> $(readlink "$link"))")
+    elif [ -d "$link" ]; then
+      [ -n "$(ls -A "$link" 2>/dev/null)" ] && do_merge+=("shared/$n")
+      do_rm+=("shared/$n  (directory)")
+    fi
+    do_link+=("$n")
+  done
+
+  if [ ${#do_link[@]} -eq 0 ]; then echo "Nothing to do."; return 0; fi
+
+  echo "Plan — link shared subdirs to your main ~/.claude:"
+  for n in "${do_link[@]}"; do echo "  shared/$n  ->  $HOME/.claude/$n"; done
+  if [ ${#do_merge[@]} -gt 0 ]; then
+    echo "First merge existing content into main (non-destructive, cp -an):"
+    for n in "${do_merge[@]}"; do echo "  $n"; done
+  fi
+  if [ ${#do_rm[@]} -gt 0 ]; then
+    echo "Then REMOVE (replaced by symlinks):"
+    for n in "${do_rm[@]}"; do echo "  $n"; done
+  fi
+  confirm "Proceed?" || { echo "Aborted — nothing changed."; return 1; }
+
+  for n in "${do_link[@]}"; do
+    link="$SHARED_DIR/$n"; target="$HOME/.claude/$n"
+    mkdir -p "$target"
+    if [ -d "$link" ] && [ ! -L "$link" ] && [ -n "$(ls -A "$link" 2>/dev/null)" ]; then
+      cp -an "$link/." "$target/" 2>/dev/null || true
+    fi
+    rm -rf "$link"
+    ln -s "$target" "$link"
+    echo "linked: shared/$n -> $target"
+  done
+}
+
+unlink_main() {
+  local names=() copy=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) CLAUDE_MULTI_YES=1; shift ;;
+      --copy)   copy=1; shift ;;
+      --all)    names=($CLAUDE_MULTI_SHARED); shift ;;
+      --*)      die "unknown unlink-main option: $1" ;;
+      *)        names+=("$1"); shift ;;
+    esac
+  done
+  [ ${#names[@]} -eq 0 ] && names=($CLAUDE_MULTI_SHARED)
+
+  local do_unlink=() n link
+  for n in "${names[@]}"; do
+    valid_name "$n" || die "invalid subdir name: '$n'"
+    link="$SHARED_DIR/$n"
+    if [ -L "$link" ]; then do_unlink+=("$n"); else echo "not linked (skipping): shared/$n"; fi
+  done
+  if [ ${#do_unlink[@]} -eq 0 ]; then echo "Nothing to do."; return 0; fi
+
+  echo "Plan — detach these shared subdirs from main (make them independent dirs again):"
+  for n in "${do_unlink[@]}"; do echo "  REMOVE symlink shared/$n  (was -> $(readlink "$SHARED_DIR/$n"))"; done
+  [ "$copy" = 1 ] && echo "Then copy main's current content back into each (cp -an)."
+  confirm "Proceed?" || { echo "Aborted — nothing changed."; return 1; }
+
+  for n in "${do_unlink[@]}"; do
+    link="$SHARED_DIR/$n"; local target; target="$(readlink -f "$link")"
+    rm -f "$link"
+    mkdir -p "$link"; chmod 700 "$link" 2>/dev/null || true
+    if [ "$copy" = 1 ] && [ -d "$target" ]; then
+      cp -an "$target/." "$link/" 2>/dev/null || true
+    fi
+    echo "detached: shared/$n is now an independent directory"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -320,6 +448,9 @@ Usage:
   claude-multi init <profile>                   Create empty profile state
   claude-multi import <profile> [opts]          Copy existing ~/.claude into a profile
        opts: --from DIR  --force  --seed-shared
+  claude-multi link-main [subdirs...] [--all]   Share subdirs with the main, non-sandboxed
+                                                ~/.claude (symlink; default: shared set)
+  claude-multi unlink-main [subdirs...] [--copy] Detach them again (--copy keeps a snapshot)
   claude-multi list                             Show profiles / login status
   claude-multi verify                           Run sandbox isolation self-test
   claude-multi where                            Print state paths
@@ -337,6 +468,8 @@ main() {
     exec)    exec_profile "$@" ;;
     init)    init_profile "${1:-}" ;;
     import)  import_profile "$@" ;;
+    link-main)   link_main "$@" ;;
+    unlink-main) unlink_main "$@" ;;
     list|ls) list_profiles ;;
     verify)  verify ;;
     where|path)
