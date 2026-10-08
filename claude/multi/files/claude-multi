@@ -411,6 +411,24 @@ exec_profile() {
 # ---------------------------------------------------------------------------
 # Info / verification
 # ---------------------------------------------------------------------------
+# Print a profile's .claude directory — a self-contained CLAUDE_CONFIG_DIR that
+# external, CLAUDE_CONFIG_DIR-aware tools (e.g. Paseo) can point at to discover
+# that profile's account/auth WITHOUT going through the sandbox wrapper. e.g.:
+#   export CLAUDE_CONFIG_DIR="$(claude-multi config-dir vcf-2)"
+config_dir() {
+  local name="${1:-}" do_export=0
+  case "$name" in --export|-e) do_export=1; name="${2:-}" ;; esac
+  [ -n "$name" ] || die "usage: claude-multi config-dir [--export] <profile>"
+  valid_name "$name" || die "invalid profile name: '$name'"
+  local d="$PROFILES_DIR/$name/.claude"
+  [ -d "$d" ] || die "profile '$name' not initialized. Run: claude-multi init $name"
+  if [ "$do_export" = 1 ]; then
+    printf 'export CLAUDE_CONFIG_DIR=%q\n' "$d"
+  else
+    printf '%s\n' "$d"
+  fi
+}
+
 list_profiles() {
   echo "Root:    $CLAUDE_MULTI_ROOT"
   echo "Shared:  $CLAUDE_MULTI_SHARED"
@@ -501,6 +519,8 @@ Usage:
                                                 ~/.claude (symlink; default: shared set)
   claude-multi unlink-main [subdirs...] [--copy] Detach them again (--copy keeps a snapshot)
   claude-multi list                             Show profiles / login status
+  claude-multi config-dir [--export] <profile>  Print a profile's CLAUDE_CONFIG_DIR
+                                                (for external tools, e.g. Paseo)
   claude-multi verify                           Run sandbox isolation self-test
   claude-multi where                            Print state paths
   claude-multi help
@@ -517,6 +537,7 @@ main() {
     exec)    exec_profile "$@" ;;
     init)    init_profile "${1:-}" ;;
     import)  import_profile "$@" ;;
+    config-dir|configdir) config_dir "$@" ;;
     link-main)   link_main "$@" ;;
     unlink-main) unlink_main "$@" ;;
     list|ls) list_profiles ;;

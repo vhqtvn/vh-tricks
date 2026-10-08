@@ -265,6 +265,23 @@ claude-b   "$@"      # account B
 No PID namespace or `--new-session` is used, so Paseo's process/session handling
 is unaffected.
 
+### Letting external tools detect a profile's account
+
+A tool that runs **outside** the wrapper (e.g. Paseo detecting which account is
+active) can point `CLAUDE_CONFIG_DIR` at a profile's `.claude` directory — it is
+a self-contained config dir (`.claude.json` + `.credentials.json`). Get the path
+with:
+
+```bash
+claude-multi config-dir vcf-2            # prints .../profiles/vcf-2/.claude
+eval "$(claude-multi config-dir --export vcf-2)"   # exports CLAUDE_CONFIG_DIR
+```
+
+You can safely export `CLAUDE_CONFIG_DIR` in your shell for such tools: the
+wrapper **ignores an inherited `CLAUDE_CONFIG_DIR`** and always forces its own
+(`$HOME/.claude`) inside the sandbox, so account isolation is never affected by
+whatever you set outside.
+
 ## Verification
 
 Automated (no login needed) — proves tests 1–6 and shared visibility:
