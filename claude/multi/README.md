@@ -11,9 +11,12 @@ account A projects    ==  account B projects
 ```
 
 Isolation is done entirely with **bubblewrap bind mounts over the real
-canonical paths** — no symlinks, no `CLAUDE_CONFIG_DIR`, no sandbox-HOME swap.
-Claude sees its normal `~/.claude` and `~/.claude.json`; only the account state
-is swapped underneath.
+canonical paths** — no symlinks, no sandbox-HOME swap. Claude sees its normal
+`~/.claude`; only the account state is swapped underneath. `CLAUDE_CONFIG_DIR`
+is set to `~/.claude` purely so the global config file lives at
+`~/.claude/.claude.json` (inside the bound directory) — see
+[Why `.claude.json` lives inside `~/.claude`](#why-claudejson-lives-inside-claude).
+The bind mounts, not `CLAUDE_CONFIG_DIR`, are what isolate the accounts.
 
 **Requires:** `bubblewrap` (`bwrap`).
 
@@ -76,8 +79,8 @@ reinstall.
 ~/.local/share/claude-multi/
 ├── profiles/
 │   ├── a/
-│   │   ├── .claude/        # PRIVATE: .credentials.json, settings.json, history.jsonl, sessions/, ...
-│   │   ├── .claude.json    # PRIVATE: account identity, project trust, MCP servers
+│   │   ├── .claude/        # PRIVATE: .claude.json (identity), .credentials.json,
+│   │   │                   #          settings.json, history.jsonl, sessions/, ...
 │   │   └── cache/          # private disposable ~/.cache
 │   └── b/ ...
 └── shared/
@@ -95,26 +98,43 @@ Bind mounts are applied **in order**:
 --bind  $PWD                    $PWD           # 1) working tree (writable) — may be/overlap $HOME
 --bind  $XDG_RUNTIME_DIR        $XDG_RUNTIME_DIR    # ssh-agent / keyring (writable)
 --bind  <profile>/.claude       ~/.claude      # 2) private account state, ON TOP of cwd
---bind  <profile>/.claude.json  ~/.claude.json # 2) private identity, ON TOP of cwd
 --bind  <profile>/cache         ~/.cache       # private disposable cache
 --bind  shared/projects         ~/.claude/projects  # 3) overlay shared, LAST (on top of .claude)
 --die-with-parent
 --setenv TMPDIR /tmp
+--setenv CLAUDE_CONFIG_DIR ~/.claude           # .claude.json lives INSIDE the bound dir
 --unsetenv ANTHROPIC_API_KEY ... (provider/API creds stripped)
 ```
 
 **Bind order matters.** bwrap applies binds in sequence, and a later bind over
 an ancestor path shadows earlier binds beneath it. The working tree (`$PWD`) and
 `$XDG_RUNTIME_DIR` can live under — or *be* — `$HOME`, so they are bound **first**;
-the per-profile `~/.claude` / `~/.claude.json` are bound **on top**; shared
-subdirs are bound **last**. If the cwd bind came after the profile binds, running
-a wrapper from your home directory (`cd ~; claude-a`, or over `ssh`, whose cwd is
-`$HOME`) would re-expose the real `~/.claude` to every profile and collapse all
-accounts into one. `claude-multi verify` tests this explicitly (checks 9–10).
+the per-profile `~/.claude` is bound **on top**; shared subdirs are bound
+**last**. If the cwd bind came after the profile bind, running a wrapper from
+your home directory (`cd ~; claude-a`, or over `ssh`, whose cwd is `$HOME`) would
+re-expose the real `~/.claude` to every profile and collapse all accounts into
+one. `claude-multi verify` tests this explicitly (checks 9–10).
+
+### Why `.claude.json` lives inside `~/.claude`
+
+Claude Code's global config `.claude.json` is normally at `~/.claude.json`
+(next to `~/.claude`, not inside it), and it is saved with an **atomic
+temp-file + `rename()`**. You cannot `rename()` over a single-file bind mount —
+it fails with `EBUSY` ("Device or resource busy") — so bind-mounting
+`~/.claude.json` as a file makes every save silently fail: the account identity
+(`oauthAccount`, shown by `claude auth status`) freezes at whatever it was
+seeded with, and all profiles appear to be the same account even though their
+`.credentials.json` differ. To avoid this, the launcher sets
+`CLAUDE_CONFIG_DIR=~/.claude`, which relocates `.claude.json` to
+`~/.claude/.claude.json` — **inside** the bound directory, where atomic renames
+work. A directory bind, unlike a single-file bind, isolates and persists
+correctly. Existing profiles are migrated automatically (the old
+`profiles/<p>/.claude.json` is moved into `profiles/<p>/.claude/`).
+`verify` check 9c guards the atomic-write path.
 
 Result inside the sandbox:
 
-- `~/.claude`, `~/.claude.json` → this profile's private state (writable).
+- `~/.claude` (incl. `~/.claude/.claude.json`) → this profile's private state (writable).
 - `~/.claude/projects` → common shared transcripts (writable) → **resume works
   across profiles**.
 - `~/.cache` → profile-local, disposable.

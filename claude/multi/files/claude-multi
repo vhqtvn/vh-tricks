@@ -108,16 +108,37 @@ ensure_shared() {
   done
 }
 
+# The global config file lives at $CLAUDE_CONFIG_DIR/.claude.json. We set
+# CLAUDE_CONFIG_DIR=$HOME/.claude inside the sandbox so .claude.json sits INSIDE
+# the bound .claude directory. This is required because Claude Code saves
+# .claude.json with an atomic temp-file + rename(), which fails with EBUSY over a
+# single-file bind mount — so a top-level ~/.claude.json bind silently never
+# persists (account identity/oauthAccount freezes). Isolation is still done by
+# the directory bind; CLAUDE_CONFIG_DIR only relocates the file into it.
+ensure_profile_config() {
+  local p="$1"
+  mkdir -p "$p/.claude"
+  # Migrate legacy layout ($p/.claude.json) into $p/.claude/.claude.json.
+  if [ -f "$p/.claude.json" ]; then
+    if [ ! -f "$p/.claude/.claude.json" ]; then
+      mv "$p/.claude.json" "$p/.claude/.claude.json"
+    else
+      rm -f "$p/.claude.json"   # new layout already present; drop the stale copy
+    fi
+  fi
+  if [ ! -e "$p/.claude/.claude.json" ]; then
+    printf '{}' > "$p/.claude/.claude.json"
+  fi
+  chmod 600 "$p/.claude/.claude.json" 2>/dev/null || true
+}
+
 init_profile() {
   local name="$1"
   valid_name "$name" || die "invalid profile name: '$name'"
   local p="$PROFILES_DIR/$name"
   mkdir -p "$p/.claude"
   chmod 700 "$p" "$p/.claude" 2>/dev/null || true
-  if [ ! -e "$p/.claude.json" ]; then
-    printf '{}' > "$p/.claude.json"
-    chmod 600 "$p/.claude.json" 2>/dev/null || true
-  fi
+  ensure_profile_config "$p"
   if [ "$CLAUDE_MULTI_CACHE" = "1" ]; then
     mkdir -p "$p/cache"
     chmod 700 "$p/cache" 2>/dev/null || true
@@ -156,10 +177,14 @@ import_profile() {
   for ex in $CLAUDE_MULTI_SHARED $RUNTIME_DIRS; do
     rm -rf "${p:?}/.claude/$ex"
   done
+  # The source's global config is at $from/.claude.json (or, if that home used
+  # CLAUDE_CONFIG_DIR, $from/.claude/.claude.json). Place it INSIDE .claude.
   if [ -f "$from/.claude.json" ]; then
-    cp -a "$from/.claude.json" "$p/.claude.json"
-    chmod 600 "$p/.claude.json" 2>/dev/null || true
+    cp -a "$from/.claude.json" "$p/.claude/.claude.json"
   fi
+  rm -f "$p/.claude.json"   # never keep the legacy top-level copy
+  ensure_profile_config "$p"
+  chmod 600 "$p/.claude/.claude.json" 2>/dev/null || true
   chmod -R u+rwX,go-rwx "$p/.claude" 2>/dev/null || true
 
   if [ "$seed" = 1 ]; then
@@ -299,7 +324,7 @@ launch_in() {
   valid_name "$name" || die "invalid profile name: '$name'"
   local p="$PROFILES_DIR/$name"
   [ -d "$p/.claude" ] || die "profile '$name' not initialized. Run: claude-multi init $name  (or: import $name)"
-  [ -e "$p/.claude.json" ] || printf '{}' > "$p/.claude.json"
+  ensure_profile_config "$p"
   require_bwrap
   ensure_shared
 
@@ -328,10 +353,9 @@ launch_in() {
     args+=( --bind "$XDG_RUNTIME_DIR" "$XDG_RUNTIME_DIR" )
   fi
   # Private account state — bound ON TOP of anything above (incl. a $HOME cwd).
-  args+=(
-    --bind "$p/.claude"      "$HOME/.claude"
-    --bind "$p/.claude.json" "$HOME/.claude.json"
-  )
+  # Only the .claude DIRECTORY is bound; .claude.json lives inside it (via
+  # CLAUDE_CONFIG_DIR below), so atomic saves work and identity persists.
+  args+=( --bind "$p/.claude" "$HOME/.claude" )
   # Profile-local disposable cache.
   if [ "$CLAUDE_MULTI_CACHE" = "1" ]; then
     mkdir -p "$p/cache"
@@ -346,6 +370,7 @@ launch_in() {
   args+=(
     --die-with-parent
     --setenv TMPDIR /tmp
+    --setenv CLAUDE_CONFIG_DIR "$HOME/.claude"
     --unsetenv ANTHROPIC_API_KEY
     --unsetenv ANTHROPIC_AUTH_TOKEN
     --unsetenv CLAUDE_CODE_OAUTH_TOKEN
@@ -419,8 +444,8 @@ verify() {
   echo "A-only" > "$PROFILES_DIR/a/.claude/MARKER-A"
   echo "B-only" > "$PROFILES_DIR/b/.claude/MARKER-B"
   echo "shared" > "$SHARED_DIR/projects/MARKER-SHARED"
-  printf 'PROFILE-A' > "$PROFILES_DIR/a/.claude.json"   # distinct identity per profile
-  printf 'PROFILE-B' > "$PROFILES_DIR/b/.claude.json"
+  printf 'PROFILE-A' > "$PROFILES_DIR/a/.claude/.claude.json"   # distinct identity per profile
+  printf 'PROFILE-B' > "$PROFILES_DIR/b/.claude/.claude.json"
 
   local fail=0
   # Run the test command in a SUBSHELL so launch_in's `exec bwrap` replaces the
@@ -442,13 +467,17 @@ verify() {
   # Cross-account session visibility (proxy for test 8):
   ( launch_in a bash -c 'echo hi > ~/.claude/projects/XSESSION.jsonl' ) >/dev/null 2>&1
   expect_ok   "8*. projects file written by A is visible to B" b '[ -f ~/.claude/projects/XSESSION.jsonl ]'
-  # .claude.json (account identity) isolation — the key auth-separation check:
-  expect_ok   "9a. A sees its own .claude.json"          a '[ "$(cat ~/.claude.json)" = PROFILE-A ]'
-  expect_ok   "9b. B sees its own .claude.json"          b '[ "$(cat ~/.claude.json)" = PROFILE-B ]'
+  # .claude.json (account identity) isolation — the key auth-separation check.
+  # It lives at $CLAUDE_CONFIG_DIR/.claude.json = ~/.claude/.claude.json.
+  expect_ok   "9a. A sees its own .claude.json"          a '[ "$(cat ~/.claude/.claude.json)" = PROFILE-A ] && [ "$CLAUDE_CONFIG_DIR" = ~/.claude ]'
+  expect_ok   "9b. B sees its own .claude.json"          b '[ "$(cat ~/.claude/.claude.json)" = PROFILE-B ]'
+  # Identity must be WRITABLE via atomic temp+rename (how Claude saves it) — the
+  # single-file-bind bug made this fail with EBUSY and froze the account.
+  expect_ok   "9c. atomic rename to .claude.json works"  a 'cat ~/.claude/.claude.json > ~/.claude/.claude.json.tmp && mv -f ~/.claude/.claude.json.tmp ~/.claude/.claude.json'
   # Regression: launched from $HOME, the cwd bind must NOT re-expose the real
-  # ~/.claude / ~/.claude.json (would make every profile the same account).
-  expect_ok_home "10a. identity isolated even when run from \$HOME (A)" a '[ "$(cat ~/.claude.json)" = PROFILE-A ] && [ -f ~/.claude/MARKER-A ]'
-  expect_ok_home "10b. identity isolated even when run from \$HOME (B)" b '[ "$(cat ~/.claude.json)" = PROFILE-B ] && [ ! -f ~/.claude/MARKER-A ]'
+  # ~/.claude (would make every profile the same account).
+  expect_ok_home "10a. identity isolated even when run from \$HOME (A)" a '[ "$(cat ~/.claude/.claude.json)" = PROFILE-A ] && [ -f ~/.claude/MARKER-A ]'
+  expect_ok_home "10b. identity isolated even when run from \$HOME (B)" b '[ "$(cat ~/.claude/.claude.json)" = PROFILE-B ] && [ ! -f ~/.claude/MARKER-A ]'
 
   rm -rf "$tmproot"
   echo
