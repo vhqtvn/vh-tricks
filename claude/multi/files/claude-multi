@@ -303,26 +303,22 @@ launch_in() {
   require_bwrap
   ensure_shared
 
+  # IMPORTANT: bwrap applies binds in order; a later bind mounted over an
+  # ancestor path SHADOWS earlier binds beneath it. The working tree, writable
+  # passthroughs and $XDG_RUNTIME_DIR may live under (or BE) $HOME, so they must
+  # be bound BEFORE the per-profile ~/.claude binds — otherwise running the
+  # wrapper from $HOME (e.g. `cd ~; claude-a`, or over ssh whose cwd is $HOME)
+  # re-exposes the real ~/.claude and ~/.claude.json to every profile, breaking
+  # account isolation. Profile state goes on top; shared overlays last.
   local args=(
     --ro-bind / /
     --proc /proc
     --dev /dev
     --tmpfs /tmp
-    # Private account state first...
-    --bind "$p/.claude"      "$HOME/.claude"
-    --bind "$p/.claude.json" "$HOME/.claude.json"
   )
-  # ...then overlay shared subdirs ON TOP of the private .claude.
-  local n
-  for n in $CLAUDE_MULTI_SHARED; do
-    args+=( --bind "$SHARED_DIR/$n" "$HOME/.claude/$n" )
-  done
-  # Profile-local disposable cache.
-  if [ "$CLAUDE_MULTI_CACHE" = "1" ]; then
-    mkdir -p "$p/cache"
-    args+=( --bind "$p/cache" "$HOME/.cache" )
-  fi
-  # Extra writable passthroughs.
+  # Writable working tree (may be / overlap $HOME) — bind FIRST.
+  args+=( --bind "$PWD" "$PWD" )
+  # Extra writable passthroughs (may live under $HOME).
   local w
   for w in $CLAUDE_MULTI_WRITABLE; do
     [ -e "$w" ] && args+=( --bind "$w" "$w" )
@@ -331,8 +327,21 @@ launch_in() {
   if [ "$CLAUDE_MULTI_RUNTIME_DIR" = "1" ] && [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
     args+=( --bind "$XDG_RUNTIME_DIR" "$XDG_RUNTIME_DIR" )
   fi
-  # Writable working tree.
-  args+=( --bind "$PWD" "$PWD" )
+  # Private account state — bound ON TOP of anything above (incl. a $HOME cwd).
+  args+=(
+    --bind "$p/.claude"      "$HOME/.claude"
+    --bind "$p/.claude.json" "$HOME/.claude.json"
+  )
+  # Profile-local disposable cache.
+  if [ "$CLAUDE_MULTI_CACHE" = "1" ]; then
+    mkdir -p "$p/cache"
+    args+=( --bind "$p/cache" "$HOME/.cache" )
+  fi
+  # Shared subdirs overlaid ON TOP of the private .claude — bound LAST.
+  local n
+  for n in $CLAUDE_MULTI_SHARED; do
+    args+=( --bind "$SHARED_DIR/$n" "$HOME/.claude/$n" )
+  done
 
   args+=(
     --die-with-parent
@@ -410,12 +419,16 @@ verify() {
   echo "A-only" > "$PROFILES_DIR/a/.claude/MARKER-A"
   echo "B-only" > "$PROFILES_DIR/b/.claude/MARKER-B"
   echo "shared" > "$SHARED_DIR/projects/MARKER-SHARED"
+  printf 'PROFILE-A' > "$PROFILES_DIR/a/.claude.json"   # distinct identity per profile
+  printf 'PROFILE-B' > "$PROFILES_DIR/b/.claude.json"
 
   local fail=0
   # Run the test command in a SUBSHELL so launch_in's `exec bwrap` replaces the
   # subshell, not this script.
   expect_ok()   { if ( launch_in "$2" bash -c "$3" ) >/dev/null 2>&1; then printf '  PASS  %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fail=1; fi; }
   expect_fail() { if ( launch_in "$2" bash -c "$3" ) >/dev/null 2>&1; then printf '  FAIL  %s\n' "$1"; fail=1; else printf '  PASS  %s\n' "$1"; fi; }
+  # Same, but run from $HOME to catch cwd-bind shadowing of the profile.
+  expect_ok_home() { if ( cd "$HOME" && launch_in "$2" bash -c "$3" ) >/dev/null 2>&1; then printf '  PASS  %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fail=1; fi; }
 
   echo "Running sandbox verification (no login required):"
   expect_ok   "1. A sees A-only marker"                  a '[ -f ~/.claude/MARKER-A ]'
@@ -429,6 +442,13 @@ verify() {
   # Cross-account session visibility (proxy for test 8):
   ( launch_in a bash -c 'echo hi > ~/.claude/projects/XSESSION.jsonl' ) >/dev/null 2>&1
   expect_ok   "8*. projects file written by A is visible to B" b '[ -f ~/.claude/projects/XSESSION.jsonl ]'
+  # .claude.json (account identity) isolation — the key auth-separation check:
+  expect_ok   "9a. A sees its own .claude.json"          a '[ "$(cat ~/.claude.json)" = PROFILE-A ]'
+  expect_ok   "9b. B sees its own .claude.json"          b '[ "$(cat ~/.claude.json)" = PROFILE-B ]'
+  # Regression: launched from $HOME, the cwd bind must NOT re-expose the real
+  # ~/.claude / ~/.claude.json (would make every profile the same account).
+  expect_ok_home "10a. identity isolated even when run from \$HOME (A)" a '[ "$(cat ~/.claude.json)" = PROFILE-A ] && [ -f ~/.claude/MARKER-A ]'
+  expect_ok_home "10b. identity isolated even when run from \$HOME (B)" b '[ "$(cat ~/.claude.json)" = PROFILE-B ] && [ ! -f ~/.claude/MARKER-A ]'
 
   rm -rf "$tmproot"
   echo

@@ -92,16 +92,25 @@ Bind mounts are applied **in order**:
 ```
 --ro-bind / /                                  # whole host, read-only
 --proc /proc  --dev /dev  --tmpfs /tmp         # fresh proc/dev, writable /tmp
---bind  <profile>/.claude       ~/.claude      # 1) private account state (writable)
---bind  <profile>/.claude.json  ~/.claude.json # 1) private identity (writable)
---bind  shared/projects         ~/.claude/projects  # 2) overlay shared on top
---bind  <profile>/cache         ~/.cache       # private disposable cache
+--bind  $PWD                    $PWD           # 1) working tree (writable) — may be/overlap $HOME
 --bind  $XDG_RUNTIME_DIR        $XDG_RUNTIME_DIR    # ssh-agent / keyring (writable)
---bind  $PWD                    $PWD           # working tree (writable)
+--bind  <profile>/.claude       ~/.claude      # 2) private account state, ON TOP of cwd
+--bind  <profile>/.claude.json  ~/.claude.json # 2) private identity, ON TOP of cwd
+--bind  <profile>/cache         ~/.cache       # private disposable cache
+--bind  shared/projects         ~/.claude/projects  # 3) overlay shared, LAST (on top of .claude)
 --die-with-parent
 --setenv TMPDIR /tmp
 --unsetenv ANTHROPIC_API_KEY ... (provider/API creds stripped)
 ```
+
+**Bind order matters.** bwrap applies binds in sequence, and a later bind over
+an ancestor path shadows earlier binds beneath it. The working tree (`$PWD`) and
+`$XDG_RUNTIME_DIR` can live under — or *be* — `$HOME`, so they are bound **first**;
+the per-profile `~/.claude` / `~/.claude.json` are bound **on top**; shared
+subdirs are bound **last**. If the cwd bind came after the profile binds, running
+a wrapper from your home directory (`cd ~; claude-a`, or over `ssh`, whose cwd is
+`$HOME`) would re-expose the real `~/.claude` to every profile and collapse all
+accounts into one. `claude-multi verify` tests this explicitly (checks 9–10).
 
 Result inside the sandbox:
 
