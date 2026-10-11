@@ -44,6 +44,12 @@ CONFIG_FILE="$XDG_CONFIG_HOME/claude-multi/config"
 : "${CLAUDE_MULTI_BIN:=claude}"
 # Auto-confirm destructive actions (used by install bootstrap / scripts).
 : "${CLAUDE_MULTI_YES:=0}"
+# Where `auto create` writes claude-<name> wrappers.
+: "${CLAUDE_MULTI_BIN_DIR:=$HOME/.local/bin}"
+BIN_DIR="$CLAUDE_MULTI_BIN_DIR"
+# Auto (virtual) profile state — see "Auto profiles" below.
+AUTO_DIR="$XDG_CONFIG_HOME/claude-multi/auto"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 PROFILES_DIR="$CLAUDE_MULTI_ROOT/profiles"
 SHARED_DIR="$CLAUDE_MULTI_ROOT/shared"
@@ -384,16 +390,22 @@ launch_in() {
 }
 
 run_profile() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: claude-multi run <profile> [claude args...]"
+  local name="${1:-}"; [ -n "$name" ] || die "usage: claude-multi run <profile|auto> [claude args...]"
   shift
+  name="$(resolve_profile "$name")" || exit 1
   local uuid; uuid="$(detect_resume_uuid "$@")"
   if [ -n "$uuid" ]; then
-    mkdir -p "$LOCK_DIR"; chmod 700 "$LOCK_DIR" 2>/dev/null || true
+    mkdir -p "$LOCK_DIR" 2>/dev/null || true; chmod 700 "$LOCK_DIR" 2>/dev/null || true
     # Hold the lock for the lifetime of the launched process (fd stays open
-    # across exec). Best-effort guard against concurrent same-UUID resume.
-    exec 9>"$LOCK_DIR/$uuid.lock"
-    if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
-      die "session $uuid is already attached in another profile/process. Refusing concurrent resume."
+    # across exec). Best-effort guard against concurrent same-UUID resume — an
+    # unwritable lock dir (e.g. launched from inside another claude-multi
+    # sandbox, where the state root is read-only) must not block the launch.
+    if { exec 9>"$LOCK_DIR/$uuid.lock"; } 2>/dev/null; then
+      if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+        die "session $uuid is already attached in another profile/process. Refusing concurrent resume."
+      fi
+    else
+      err "warning: cannot create $LOCK_DIR/$uuid.lock; skipping the concurrent-resume guard."
     fi
   fi
   launch_in "$name" "$CLAUDE_MULTI_BIN" "$@"
@@ -401,11 +413,234 @@ run_profile() {
 
 # exec_profile <profile> -- <command...>   (run an arbitrary command sandboxed)
 exec_profile() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: claude-multi exec <profile> -- <command...>"
+  local name="${1:-}"; [ -n "$name" ] || die "usage: claude-multi exec <profile|auto> -- <command...>"
   shift
+  name="$(resolve_profile "$name")" || exit 1
   [ "${1:-}" = "--" ] && shift
   [ $# -gt 0 ] || die "no command given"
   launch_in "$name" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Auto profiles: a virtual profile mapped onto real ones
+# ---------------------------------------------------------------------------
+# An auto profile (e.g. "auto" -> vcf-2 vcf-4) has no account of its own; it
+# points at ONE of its member profiles (its "active" member). `run <auto>` and
+# its wrapper claude-<auto> resolve that member at LAUNCH time, because a
+# running Claude keeps the account it started with. `switch <auto>` moves the
+# pointer and (when Paseo is installed) restarts the idle Paseo agents on the
+# provider claude-<auto>, which resume the same session under the new account.
+#
+# State: $AUTO_DIR/<name>, plain "key=value" lines (never sourced):
+#   profiles=vcf-2 vcf-4
+#   active=vcf-2
+
+auto_file()  { printf '%s/%s\n' "$AUTO_DIR" "$1"; }
+is_auto()    { valid_name "$1" && [ -f "$(auto_file "$1")" ]; }
+is_profile() { valid_name "$1" && [ -d "$PROFILES_DIR/$1/.claude" ]; }
+logged_in()  { [ -s "$PROFILES_DIR/$1/.claude/.credentials.json" ]; }
+
+# auto_get <name> <key>
+auto_get() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "$2="*) printf '%s\n' "${line#"$2="}"; return 0 ;; esac
+  done < "$(auto_file "$1")"
+}
+
+# auto_put <name> <profiles> <active>   (atomic: a concurrent launch sees old or new)
+auto_put() {
+  mkdir -p "$AUTO_DIR"; chmod 700 "$AUTO_DIR" 2>/dev/null || true
+  local f; f="$(auto_file "$1")"
+  printf '# claude-multi auto profile (managed by: claude-multi auto / switch)\nprofiles=%s\nactive=%s\n' "$2" "$3" > "$f.tmp.$$"
+  mv -f "$f.tmp.$$" "$f"
+}
+
+list_autos() {
+  local f
+  [ -d "$AUTO_DIR" ] || return 0
+  for f in "$AUTO_DIR"/*; do
+    [ -f "$f" ] && valid_name "$(basename "$f")" && basename "$f"
+  done
+  return 0
+}
+
+# Print the real profile an auto currently maps to: its active member if that
+# is still a valid member, else the first initialized member.
+auto_resolve() {
+  local name="$1" act members m
+  is_auto "$name" || die "no such auto profile: '$name'"
+  act="$(auto_get "$name" active)"; members="$(auto_get "$name" profiles)"
+  if [ -n "$act" ] && case " $members " in *" $act "*) true ;; *) false ;; esac && is_profile "$act"; then
+    printf '%s\n' "$act"; return 0
+  fi
+  for m in $members; do
+    if is_profile "$m"; then
+      [ -n "$act" ] && err "auto '$name': active '$act' is not a usable member; using '$m'."
+      printf '%s\n' "$m"; return 0
+    fi
+  done
+  die "auto '$name' has no initialized member profiles ($members)."
+}
+
+# Map a run target to a real profile (autos resolve; real names pass through).
+resolve_profile() {
+  if is_auto "$1"; then
+    is_profile "$1" && die "'$1' is both a profile and an auto profile; remove one."
+    auto_resolve "$1"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# (Re)write ~/.local/bin/claude-<name>. Never clobbers a file we didn't make.
+write_auto_wrapper() {
+  local name="$1" w="$BIN_DIR/claude-$1"
+  if [ -e "$w" ] && ! grep -q '^# vh-tricks claude/multi' "$w" 2>/dev/null; then
+    err "not overwriting $w (not a claude-multi wrapper)."; return 0
+  fi
+  mkdir -p "$BIN_DIR"
+  cat > "$w" <<EOW
+#!/usr/bin/env bash
+# vh-tricks claude/multi — launch Claude Code as auto profile '$name' (follows 'claude-multi switch $name')
+exec "$SELF" run "$name" "\$@"
+EOW
+  chmod +x "$w"
+  echo "Wrapper: $w"
+}
+
+# auto create <name> [profiles...]   (idempotent; no profiles = keep current set)
+auto_create() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: claude-multi auto create <name> [profiles...]"
+  shift
+  valid_name "$name" || die "invalid auto profile name: '$name'"
+  case "$name" in multi) die "'multi' is reserved (claude-multi)." ;; esac
+  is_profile "$name" && die "'$name' is already a real profile; pick another auto name."
+  local list=("$@") members m act=""
+  if [ ${#list[@]} -eq 0 ]; then
+    if is_auto "$name"; then members="$(auto_get "$name" profiles)"; else members="${CLAUDE_MULTI_PROFILES:-}"; fi
+    read -r -a list <<< "$members"
+  fi
+  [ ${#list[@]} -gt 0 ] || die "auto '$name' needs at least one member profile."
+  members="${list[*]}"
+  for m in "${list[@]}"; do
+    valid_name "$m" || die "invalid member profile name: '$m'"
+    is_auto "$m" && die "member '$m' is an auto profile; members must be real profiles."
+    is_profile "$m" || die "member '$m' is not an initialized profile. Run: claude-multi init $m"
+  done
+  is_auto "$name" && act="$(auto_get "$name" active)"
+  case " $members " in *" $act "*) [ -n "$act" ] || act="${members%% *}" ;; *) act="${members%% *}" ;; esac
+  auto_put "$name" "$members" "$act"
+  echo "Auto profile '$name' -> [$members], active: $act"
+  write_auto_wrapper "$name"
+}
+
+auto_rm() {
+  local name="${1:-}"; is_auto "$name" || die "no such auto profile: '$name'"
+  rm -f "$(auto_file "$name")"
+  local w="$BIN_DIR/claude-$name"
+  if [ -f "$w" ] && grep -q "^exec .* run \"$name\"" "$w" 2>/dev/null; then rm -f "$w"; echo "Removed $w"; fi
+  echo "Removed auto profile '$name'. (Paseo agents on claude-$name will fail to launch until re-pointed.)"
+}
+
+auto_list() {
+  local a any=0
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue; any=1
+    printf '  - %-12s -> %-12s [%s]\n' "$a" "$(auto_resolve "$a" 2>/dev/null || echo '?')" "$(auto_get "$a" profiles)"
+  done < <(list_autos)
+  [ "$any" = 1 ] || echo "  (none)  create one: claude-multi auto create auto <profile...>"
+}
+
+auto_cmd() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    create|set|add) auto_create "$@" ;;
+    rm|remove|delete) auto_rm "$@" ;;
+    list|ls) echo "Auto profiles:"; auto_list ;;
+    *) die "usage: claude-multi auto [list | create <name> [profiles...] | rm <name>]" ;;
+  esac
+}
+
+# Next logged-in member after $2 in auto $1's order (wraps around).
+next_member() {
+  local name="$1" cur="$2" list=() i n start=0
+  read -r -a list <<< "$(auto_get "$name" profiles)"
+  for i in "${!list[@]}"; do [ "${list[$i]}" = "$cur" ] && start=$((i + 1)); done
+  for ((i = 0; i < ${#list[@]}; i++)); do
+    n="${list[$(((start + i) % ${#list[@]}))]}"
+    [ "$n" = "$cur" ] && continue
+    is_profile "$n" && logged_in "$n" && { printf '%s\n' "$n"; return 0; }
+  done
+  die "auto '$name': no other logged-in member to switch to (current: $cur)."
+}
+
+# Restart IDLE Paseo agents on provider $1 so they relaunch under the new
+# account (`paseo agent reload` resumes the same session id). Running agents
+# are never touched — reload cancels an in-flight turn; they keep the old
+# account until their next restart (re-run `switch <auto> --reload` later).
+paseo_reload_idle() {
+  local provider="$1"
+  command -v paseo >/dev/null 2>&1 || { echo "paseo not found; skipping agent reload."; return 0; }
+  command -v jq >/dev/null 2>&1 || { err "jq not found; skipping paseo agent reload."; return 0; }
+  local json
+  json="$(paseo ls -g --json 2>/dev/null)" || { err "paseo ls failed (daemon down?); skipping reload."; return 0; }
+  local id status label busy=0 done_n=0
+  while IFS=$'\t' read -r id status label; do
+    [ -n "$id" ] || continue
+    if [ "$status" != idle ]; then
+      echo "  skip    ${id:0:8} ($status) $label"; busy=$((busy + 1)); continue
+    fi
+    if paseo agent reload "$id" >/dev/null 2>&1; then
+      echo "  reload  ${id:0:8} $label"; done_n=$((done_n + 1))
+    else
+      err "  reload FAILED for ${id:0:8} ($label)"
+    fi
+  done < <(printf '%s' "$json" | jq -r --arg p "$provider/" \
+      '.[] | select((.provider // "") | startswith($p)) | [.id, .status, ((.name // "") | .[0:50])] | @tsv')
+  echo "Paseo '$provider': reloaded $done_n idle agent(s); left $busy busy agent(s) alone."
+}
+
+# switch [auto] [profile] [--reload|--no-reload]
+#   auto defaults to the only auto profile; no profile = rotate to the next
+#   logged-in member.
+switch_profile() {
+  local pos=() reload=auto
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reload)    reload=1; shift ;;
+      --no-reload) reload=0; shift ;;
+      --*) die "unknown switch option: $1" ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  local name="" target=""
+  if [ ${#pos[@]} -gt 0 ] && is_auto "${pos[0]}"; then
+    name="${pos[0]}"; target="${pos[1]:-}"
+    [ ${#pos[@]} -le 2 ] || die "usage: claude-multi switch [auto] [profile]"
+  else
+    [ ${#pos[@]} -le 1 ] || die "'${pos[0]}' is not an auto profile."
+    local autos; autos="$(list_autos)"
+    [ -n "$autos" ] || die "no auto profiles. Create one: claude-multi auto create auto <profile...>"
+    [ "$(printf '%s\n' "$autos" | wc -l)" -eq 1 ] || die "several auto profiles; name one: claude-multi switch <auto> [profile]"
+    name="$autos"; target="${pos[0]:-}"
+  fi
+  local cur; cur="$(auto_resolve "$name")" || exit 1
+  if [ -z "$target" ]; then
+    target="$(next_member "$name" "$cur")" || exit 1
+  else
+    case " $(auto_get "$name" profiles) " in
+      *" $target "*) ;;
+      *) die "'$target' is not a member of auto '$name' ($(auto_get "$name" profiles))." ;;
+    esac
+    is_profile "$target" || die "profile '$target' not initialized."
+    logged_in "$target" || die "profile '$target' is not logged in. Run: claude-multi run $target  then /login"
+  fi
+  auto_put "$name" "$(auto_get "$name" profiles)" "$target"
+  if [ "$cur" = "$target" ]; then echo "$name -> $target (unchanged)"; else echo "$name: $cur -> $target"; fi
+  if [ "$reload" = 1 ] || { [ "$reload" = auto ] && command -v paseo >/dev/null 2>&1; }; then
+    paseo_reload_idle "claude-$name"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -445,6 +680,8 @@ list_profiles() {
   else
     echo "  (none)"
   fi
+  echo "Auto profiles (name -> active [members]):"
+  auto_list
 }
 
 verify() {
@@ -456,6 +693,9 @@ verify() {
   SHARED_DIR="$CLAUDE_MULTI_ROOT/shared"
   CLAUDE_MULTI_SHARED="projects"
   CLAUDE_MULTI_CACHE=1
+  CLAUDE_MULTI_PROFILES="a b"
+  AUTO_DIR="$tmproot/auto"        # never touch the real auto state / wrappers
+  BIN_DIR="$tmproot/bin"
 
   init_profile a >/dev/null
   init_profile b >/dev/null
@@ -497,6 +737,31 @@ verify() {
   expect_ok_home "10a. identity isolated even when run from \$HOME (A)" a '[ "$(cat ~/.claude/.claude.json)" = PROFILE-A ] && [ -f ~/.claude/MARKER-A ]'
   expect_ok_home "10b. identity isolated even when run from \$HOME (B)" b '[ "$(cat ~/.claude/.claude.json)" = PROFILE-B ] && [ ! -f ~/.claude/MARKER-A ]'
 
+  # Auto profiles / switch. Subshells: die() exits. --no-reload keeps paseo out.
+  check() { if ( eval "$2" ) >/dev/null 2>&1; then printf '  PASS  %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; fail=1; fi; }
+  check "11a. auto create maps to first member"       'auto_create auto a b && [ "$(auto_resolve auto)" = a ] && [ -x "$BIN_DIR/claude-auto" ]'
+  check "11b. auto name may not shadow a profile"     '! ( auto_create a b )'
+  check "11c. auto members must be real profiles"     '! ( auto_create x a nope )'
+  check "11d. switch refuses a not-logged-in member"  '! ( switch_profile auto b --no-reload )'
+  echo '{}' > "$PROFILES_DIR/a/.claude/.credentials.json"
+  echo '{}' > "$PROFILES_DIR/b/.claude/.credentials.json"
+  check "11e. switch <auto> <member> sets it"         'switch_profile auto b --no-reload && [ "$(auto_resolve auto)" = b ]'
+  check "11f. switch (no arg) rotates b -> a"         'switch_profile --no-reload && [ "$(auto_resolve auto)" = a ]'
+  check "11g. switch <member> (sole auto) works"      'switch_profile b --no-reload && [ "$(auto_resolve auto)" = b ]'
+  check "11h. switch rejects a non-member"            '! ( switch_profile auto nope --no-reload )'
+  check "11i. re-create keeps active, wrapper -> run" 'auto_create auto && [ "$(auto_resolve auto)" = b ] && grep -q "run \"auto\"" "$BIN_DIR/claude-auto"'
+  rm -f "$PROFILES_DIR/a/.claude/.credentials.json"
+  check "11j. rotate skips logged-out members"        '! ( switch_profile auto --no-reload )'
+  auto_put auto "a b" nope
+  check "11k. stale active falls back to 1st member"  '[ "$(auto_resolve auto)" = a ]'
+  auto_put auto "a b" b
+  check "11l. run <auto> launches the active member"  \
+    'CLAUDE_MULTI_BIN=bash run_profile auto -c "[ \"\$(cat ~/.claude/.claude.json)\" = PROFILE-B ]"'
+  auto_put auto "a b" a
+  check "11m. run <auto> follows a switch"            \
+    'CLAUDE_MULTI_BIN=bash run_profile auto -c "[ \"\$(cat ~/.claude/.claude.json)\" = PROFILE-A ] && [ ! -f ~/.claude/MARKER-B ]"'
+  check "11n. several autos: switch needs a name"     'auto_create other a b && ! ( switch_profile --no-reload )'
+
   rm -rf "$tmproot"
   echo
   if [ "$fail" = 0 ]; then echo "All sandbox checks PASSED."; else echo "Some checks FAILED."; fi
@@ -510,7 +775,17 @@ usage() {
 claude-multi — multi-account Claude Code launcher (isolated auth, shared sessions)
 
 Usage:
-  claude-multi run <profile> [claude args...]   Launch Claude as <profile>
+  claude-multi run <profile|auto> [args...]     Launch Claude as <profile> (an auto
+                                                profile resolves to its active member)
+  claude-multi auto create <name> [profiles...]  Create/update an AUTO profile: a virtual
+                                                profile mapped onto real ones, launched via
+                                                'run <name>' or the claude-<name> wrapper
+  claude-multi auto [list] | auto rm <name>     List / remove auto profiles
+  claude-multi switch [auto] [profile] [--no-reload]
+                                                Point an auto profile at a member (no profile:
+                                                rotate to the next logged-in one), then reload
+                                                IDLE Paseo agents on provider claude-<auto>
+                                                (when paseo is installed; --reload forces)
   claude-multi exec <profile> -- <cmd...>       Run any command in the sandbox
   claude-multi init <profile>                   Create empty profile state
   claude-multi import <profile> [opts]          Copy existing ~/.claude into a profile
@@ -527,6 +802,7 @@ Usage:
 
 Config: $CONFIG_FILE
 Root:   $CLAUDE_MULTI_ROOT   Shared: $CLAUDE_MULTI_SHARED
+Autos:  $AUTO_DIR
 EOF
 }
 
@@ -534,6 +810,8 @@ main() {
   local cmd="${1:-help}"; shift || true
   case "$cmd" in
     run)     run_profile "$@" ;;
+    auto)    auto_cmd "$@" ;;
+    switch)  switch_profile "$@" ;;
     exec)    exec_profile "$@" ;;
     init)    init_profile "${1:-}" ;;
     import)  import_profile "$@" ;;
@@ -546,7 +824,8 @@ main() {
       echo "root=$CLAUDE_MULTI_ROOT"
       echo "profiles=$PROFILES_DIR"
       echo "shared=$SHARED_DIR"
-      echo "config=$CONFIG_FILE" ;;
+      echo "config=$CONFIG_FILE"
+      echo "autos=$AUTO_DIR" ;;
     help|-h|--help) usage ;;
     *) err "unknown command: $cmd"; usage; exit 2 ;;
   esac

@@ -207,7 +207,9 @@ claude-b --resume UUID   # = claude-multi run b  -> claude --resume UUID
 Or the dispatcher directly:
 
 ```bash
-claude-multi run a [claude args...]     # launch
+claude-multi run a [claude args...]     # launch (a profile or an auto profile)
+claude-multi auto create auto a b       # auto profile 'auto' -> [a b] + claude-auto wrapper
+claude-multi switch [auto] [profile]    # repoint an auto profile (no profile: rotate)
 claude-multi list                       # profiles + login status
 claude-multi init <profile>             # create empty profile
 claude-multi import <profile> [opts]    # migrate existing ~/.claude in
@@ -264,6 +266,70 @@ claude-b   "$@"      # account B
 
 No PID namespace or `--new-session` is used, so Paseo's process/session handling
 is unaffected.
+
+### Switching accounts without re-creating agents (auto profiles)
+
+A Paseo agent is bound to its provider for life, and a running Claude keeps the
+account it started with. So instead of one provider per account, give Paseo ONE
+provider whose command picks the account **at launch time**: an *auto
+profile*, a virtual profile mapped onto real ones.
+
+```bash
+claude-multi auto create auto vcf-2 vcf-4   # writes ~/.config/claude-multi/auto/auto
+                                            # and the wrapper ~/.local/bin/claude-auto
+claude-multi auto list                      # auto -> vcf-2 [vcf-2 vcf-4]
+```
+
+`install.sh` creates `auto` -> all configured profiles on first install, and
+refreshes the wrappers of existing auto profiles on update. You can have several
+(e.g. `work` -> `a b`, `perso` -> `c d`); each gets a `claude-<name>` wrapper and
+should get its own Paseo provider `claude-<name>`:
+
+```jsonc
+// ~/.paseo/config.json -> agents.providers   (then: paseo daemon reload)
+"claude-auto": {
+  "extends": "claude",
+  "label": "Claude (active account)",
+  "command": ["/home/<you>/.local/bin/claude-auto"]
+}
+```
+
+When an account's 5h quota runs out:
+
+```bash
+claude-multi switch            # rotate 'auto' to its next logged-in member
+claude-multi switch vcf-4      # or pick one (when there is a single auto profile)
+claude-multi switch work c     # name the auto profile when there are several
+```
+
+`switch` rewrites the pointer atomically, then (if `paseo` is on `PATH`)
+runs `paseo agent reload` on every **idle** agent whose provider is
+`claude-<auto>/…`. Reload closes the old process and lazily relaunches the same
+command with `--resume=<same session id>` on the next prompt, so context is
+kept and the new process runs under the new account. Agents that are
+`running`/waiting for permission are **never** reloaded (a reload cancels the
+turn); they keep the old account until their next restart: re-run
+`claude-multi switch auto <same-profile> --reload` once they are idle.
+`--no-reload` only moves the pointer.
+
+> Caveat: Paseo reports `idle` as soon as the turn ends, even if Claude still
+> has a **background** shell task running (`run_in_background`). Reloading such
+> an agent kills that task. Check before switching if you rely on long
+> background jobs.
+
+Migrating an existing per-account agent onto `claude-auto` is one last
+re-import (the transcript is shared, so the session id carries over):
+
+```bash
+# session id + cwd of each live per-account agent (from Paseo's agent records):
+for f in ~/.paseo/agents/*/*.json; do
+  jq -r 'select(.archivedAt == null and (.provider | startswith("claude-vcf")))
+         | [.id, .persistence.sessionId, .cwd] | @tsv' "$f"
+done
+# then, per agent, while it is idle:
+paseo agent archive <agent-id>
+paseo import <session-id> --provider claude-auto --cwd <cwd>
+```
 
 ### Letting external tools detect a profile's account
 

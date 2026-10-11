@@ -51,6 +51,10 @@ list_profile_wrappers() {
 if [ "$1" = "--uninstall" ] || [ "$1" = "--purge" ]; then
   rm -f "$LAUNCHER"
   for w in $(list_profile_wrappers); do rm -f "$w"; done
+  # Auto-profile wrappers (claude-<auto>) carry the same marker comment.
+  for w in "$BIN_DIR"/claude-*; do
+    [ -f "$w" ] && grep -q '^# vh-tricks claude/multi' "$w" && rm -f "$w"
+  done
   remove_rc_block
   if [ "$1" = "--purge" ]; then
     rm -rf "${CLAUDE_MULTI_ROOT:-$XDG_DATA_HOME/claude-multi}"
@@ -118,6 +122,7 @@ chmod +x "$LAUNCHER"
 # we just (re)create wrappers for the configured set.
 for prof in $CLAUDE_MULTI_PROFILES; do
   case "$prof" in ''|*[!A-Za-z0-9_.-]*) echo "skip invalid profile name: '$prof'"; continue ;; esac
+  case "$prof" in auto|multi) echo "skip wrapper for profile '$prof' (claude-$prof is reserved)"; continue ;; esac
   wrapper="$BIN_DIR/claude-$prof"
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
@@ -134,6 +139,18 @@ for prof in $CLAUDE_MULTI_PROFILES; do
   case "$prof" in ''|*[!A-Za-z0-9_.-]*) continue ;; esac
   "$LAUNCHER" init "$prof" >/dev/null || true
 done
+
+# Auto profiles: refresh wrappers for existing ones; on first install create
+# "auto" -> all configured profiles (wrapper claude-auto). State lives in
+# $CONFIG_DIR/auto/ and is never overwritten here.
+if [ -n "$(ls -A "$CONFIG_DIR/auto" 2>/dev/null)" ]; then
+  for a in "$CONFIG_DIR"/auto/*; do
+    [ -f "$a" ] && "$LAUNCHER" auto create "$(basename "$a")" >/dev/null || true
+  done
+elif [ -n "$CLAUDE_MULTI_PROFILES" ] && [ ! -e "$BIN_DIR/claude-auto" ]; then
+  "$LAUNCHER" auto create auto $CLAUDE_MULTI_PROFILES || true
+fi
+"$LAUNCHER" auto list || true
 
 # Optionally share selected subdirs with the main (non-sandboxed) ~/.claude.
 # link-main checks + confirms every removal itself (prompting on /dev/tty, which
@@ -169,6 +186,7 @@ echo "  2. (optional) seed first profile from your current login:"
 echo "       claude-multi import ${CLAUDE_MULTI_PROFILES%% *} --seed-shared"
 echo "  3. Log each profile in:   claude-a   then /login    (then claude-b ...)"
 echo "  4. Verify isolation:      claude-multi verify"
+echo "  5. Switch accounts:        claude-multi switch [auto] [profile]   (claude-auto follows it)"
 echo
 echo "Uninstall (keep state): curl ... | bash -s -- --uninstall"
 echo "Full reset:             curl ... | bash -s -- --purge"
