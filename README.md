@@ -2,6 +2,12 @@
 
 Personal shell/dev environment tricks, installable via `curl | bash`.
 
+**Update all installed tricks** (re-runs the installer of each trick it detects; settings are kept):
+```bash
+curl -fsSL https://raw.githubusercontent.com/vhqtvn/vh-tricks/main/update.sh | bash
+```
+`bash -s -- --list` shows what's installed; `bash -s -- nvm/global` updates only the named tricks.
+
 ## Tricks
 
 ### nvm/global — Auto-switching node version wrapper
