@@ -12,7 +12,8 @@ Wraps `node`, `npm`, `pnpm`, `yarn` to automatically switch node versions based 
 - Intercepts `node`/`npm`/`pnpm`/`yarn` calls, auto-detects `.nvmrc`, installs & switches node version
 - Global npm packages (`~/.npm-global/`) always use LTS node regardless of project `.nvmrc`
 - `npm-global install <pkg>` — install packages globally with LTS node
-- `npm-global vhpatch` — patch shebangs in global bins to use the wrapper
+- Each global bin gets a shim in `~/.npm-global/shims/` (ahead of `bin/` on PATH) that runs it on the pinned node (`~/.npm-global/.nvmrc`), even when `node` on PATH is the system one. No shebang patching, so package self-updates keep working; adds ~0ms over plain node
+- `npm-global sync` — re-resolve the pinned node (e.g. pick up a new LTS) and regenerate shims; runs automatically after every `npm-global` command
 
 **Requires:** [nvm](https://github.com/nvm-sh/nvm)
 

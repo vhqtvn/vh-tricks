@@ -21,6 +21,8 @@ if [ "$1" = "--uninstall" ]; then
   rmdir "$WRAPPER_DIR" 2>/dev/null || true
   rmdir "$HOME/.local/bin/once-wrapper" 2>/dev/null || true
   rm -f "$BIN_DIR/npm-global"
+  rm -rf "$HOME/.npm-global/shims"
+  rm -f "$HOME/.npm-global/node" "$HOME/.npm-global/.node.spec"
   remove_rc_block
   echo "Uninstalled nvm/global trick."
   exit 0
@@ -47,11 +49,13 @@ done
 # Setup npm-global prefix
 mkdir -p "$HOME/.npm-global"
 [ -f "$HOME/.npm-global/.nvmrc" ] || echo "lts/*" > "$HOME/.npm-global/.nvmrc"
+# Pin node and create shims for already-installed global bins
+"$BIN_DIR/npm-global" sync
 
 # Idempotent: remove old block then re-add
 remove_rc_block
 PATH_BLOCK="$MARKER_BEGIN
-export PATH=\"\$HOME/.local/bin/once-wrapper/node:\$HOME/.local/bin:\$HOME/.npm-global/bin:\$PATH\"
+export PATH=\"\$HOME/.local/bin/once-wrapper/node:\$HOME/.local/bin:\$HOME/.npm-global/shims:\$HOME/.npm-global/bin:\$PATH\"
 $MARKER_END"
 for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
   [ -f "$rc" ] || continue

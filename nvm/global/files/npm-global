@@ -1,28 +1,100 @@
 #!/bin/bash
-mkdir -p ~/.npm-global
-[ -f ~/.npm-global/.nvmrc ] || echo "lts/*" > ~/.npm-global/.nvmrc
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" --no-use
-pushd ~/.npm-global > /dev/null
-nvm install > /dev/null 2>&1 && nvm use > /dev/null 2>&1
-popd > /dev/null
+# npm-global: manage global npm packages in ~/.npm-global with a pinned node.
+#
+#   npm-global <npm args>   run npm with -g and prefix ~/.npm-global, then sync
+#   npm-global sync         re-resolve the pinned node and regenerate shims
+#
+# Each global bin gets a shim ~/.npm-global/shims/<name> -> this script. When
+# invoked through a shim, this script acts as a launcher: node entrypoints run
+# on ~/.npm-global/node (cached symlink to the pinned node), anything else is
+# exec'd as-is. The launch path uses only bash builtins: no nvm, no forks.
+ROOT="$HOME/.npm-global"
+NAME="${0##*/}"
+
+# Resolve ~/.npm-global/.nvmrc via nvm (installing if needed), point
+# ~/.npm-global/node at it, and regenerate shims for ~/.npm-global/bin.
+do_sync() {
+  local self spec node name shim
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  mkdir -p "$ROOT/bin" "$ROOT/shims"
+  [ -f "$ROOT/.nvmrc" ] || echo "lts/*" > "$ROOT/.nvmrc"
+  export NVM_DIR="$HOME/.nvm"
+  [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" --no-use
+  read -r spec < "$ROOT/.nvmrc"
+  node="$(nvm which "$spec" 2>/dev/null)"
+  if [ ! -x "$node" ]; then
+    nvm install "$spec" >&2 || return 1
+    node="$(nvm which "$spec" 2>/dev/null)"
+  fi
+  [ -x "$node" ] || return 1
+  ln -sfn "$node" "$ROOT/.node.$$" && mv -f "$ROOT/.node.$$" "$ROOT/node"
+  echo "$spec" > "$ROOT/.node.spec"
+
+  for name in "$ROOT"/bin/*; do
+    [ -e "$name" ] || continue
+    name="${name##*/}"
+    shim="$ROOT/shims/$name"
+    [ "$(readlink "$shim")" = "$self" ] && continue
+    ln -sfn "$self" "$shim.$$" && mv -f "$shim.$$" "$shim"
+  done
+  for shim in "$ROOT"/shims/*; do
+    [ -L "$shim" ] || continue
+    [ -e "$ROOT/bin/${shim##*/}" ] || rm -f "$shim"
+  done
+}
+
+# Launcher mode: invoked via a shim
+if [ "$NAME" != "npm-global" ]; then
+  entry="$ROOT/bin/$NAME"
+  if [ ! -x "$entry" ]; then
+    echo "[npm-global] $NAME is no longer installed in $ROOT/bin (run: npm-global sync)" >&2
+    exit 127
+  fi
+  shebang=
+  IFS= read -r -n 255 shebang 2>/dev/null < "$entry"
+  shebang="${shebang%$'\r'}"
+  re='^#![[:space:]]*(/usr/bin/env[[:space:]]+(-S[[:space:]]+)?)?([^[:space:]]*/)?node([[:space:]]+(.*))?$'
+  [[ "$shebang" =~ $re ]] || exec "$entry" "$@"
+  flags="${BASH_REMATCH[5]}"
+  if [[ "$flags" == *[\"\'\\\$]* ]]; then
+    echo "[npm-global] unsupported node flags in $entry shebang, running it as-is" >&2
+    exec "$entry" "$@"
+  fi
+  read -r -a flags <<< "$flags"
+  spec= synced=
+  read -r spec 2>/dev/null < "$ROOT/.nvmrc"
+  read -r synced 2>/dev/null < "$ROOT/.node.spec"
+  if [ ! -x "$ROOT/node" ] || [ "$spec" != "$synced" ]; then
+    do_sync >/dev/null || { echo "[npm-global] cannot resolve node for $ROOT/.nvmrc" >&2; exit 127; }
+  fi
+  # Same as the node wrapper: npm run by the app (e.g. self-update) installs into ~/.npm-global
+  export npm_config_prefix="$ROOT"
+  exec "$ROOT/node" "${flags[@]}" "$entry" "$@"
+fi
 
 case "$1" in
-  vhexec)
-    shift
-    exec node "$@"
+  sync|vhpatch)
+    do_sync
     ;;
-  vhpatch)
-    for script in ~/.npm-global/bin/*; do
-      [ -e "$script" ] || continue
-      target=$(readlink -f "$script")
-      [ -f "$target" ] && [ -x "$target" ] || continue
-      sed -i '1s|^#!/.*|#!/usr/bin/env -S '"$0"' vhexec|' "$target"
-    done
+  vhexec)
+    # Legacy: bins patched by older versions have `#!/usr/bin/env -S npm-global vhexec`
+    shift
+    [ -x "$ROOT/node" ] || do_sync >/dev/null || exit 1
+    exec "$ROOT/node" "$@"
     ;;
   *)
+    mkdir -p "$ROOT"
+    [ -f "$ROOT/.nvmrc" ] || echo "lts/*" > "$ROOT/.nvmrc"
+    export NVM_DIR="$HOME/.nvm"
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" --no-use
+    pushd "$ROOT" > /dev/null
+    nvm install > /dev/null 2>&1 && nvm use > /dev/null 2>&1
+    popd > /dev/null
     [[ "$*" =~ (^| )(-g|--global)( |$) ]] || set -- "$1" -g "${@:2}"
-    export npm_config_prefix="$HOME/.npm-global"
+    export npm_config_prefix="$ROOT"
     npm "$@"
+    rc=$?
+    do_sync
+    exit $rc
     ;;
 esac
