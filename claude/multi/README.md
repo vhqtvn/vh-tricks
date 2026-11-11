@@ -210,6 +210,7 @@ Or the dispatcher directly:
 claude-multi run a [claude args...]     # launch (a profile or an auto profile)
 claude-multi auto create auto a b       # auto profile 'auto' -> [a b] + claude-auto wrapper
 claude-multi switch [auto] [profile]    # repoint an auto profile (no profile: rotate)
+claude-multi quota [profile|auto] [--json]  # 5h / 7d usage + reset time per profile
 claude-multi list                       # profiles + login status
 claude-multi init <profile>             # create empty profile
 claude-multi import <profile> [opts]    # migrate existing ~/.claude in
@@ -301,6 +302,23 @@ claude-multi switch            # rotate 'auto' to its next logged-in member
 claude-multi switch vcf-4      # or pick one (when there is a single auto profile)
 claude-multi switch work c     # name the auto profile when there are several
 ```
+
+Check which account has headroom first:
+
+```bash
+$ claude-multi quota
+PROFILE      5H     5H RESETS                  7D     7D RESETS
+vcf-2        3%     Thu 05:10 (in 4h51m)       21%    Sun 15 Nov 11:00 (in 3d10h) active: auto
+vcf-4        -      logged_out: no OAuth token; run: claude-multi run vcf-4  then /login
+```
+
+`quota --json` prints an array, one object per profile: `profile`, `status`
+(`ok` | `logged_out` | `auth_expired` | `error`), `five_hour` / `seven_day`
+(`percent`, `resets_at` ISO-8601, `resets_in_s`), the raw `limits` list, and
+`active_in` (auto profiles currently pointing at it). It calls the same usage
+endpoint as Claude Code's `/usage` with each profile's token, and never
+refreshes tokens: an expired one shows as `auth_expired` until Claude next runs
+on that profile. Needs `curl` and `jq`.
 
 `switch` rewrites the pointer atomically, then (if `paseo` is on `PATH`)
 runs `paseo agent reload` on every **idle** agent whose provider is

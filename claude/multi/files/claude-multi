@@ -438,7 +438,9 @@ exec_profile() {
 auto_file()  { printf '%s/%s\n' "$AUTO_DIR" "$1"; }
 is_auto()    { valid_name "$1" && [ -f "$(auto_file "$1")" ]; }
 is_profile() { valid_name "$1" && [ -d "$PROFILES_DIR/$1/.claude" ]; }
-logged_in()  { [ -s "$PROFILES_DIR/$1/.claude/.credentials.json" ]; }
+# Logged in = a non-blank OAuth refresh/access token (a failed refresh leaves
+# the file in place with the tokens blanked).
+logged_in()  { grep -qE '"(refreshToken|accessToken)" *: *"[^"]' "$PROFILES_DIR/$1/.claude/.credentials.json" 2>/dev/null; }
 
 # auto_get <name> <key>
 auto_get() {
@@ -598,6 +600,16 @@ paseo_reload_idle() {
     fi
   done < <(printf '%s' "$json" | jq -r --arg p "$provider/" \
       '.[] | select((.provider // "") | startswith($p)) | [.id, .status, ((.name // "") | .[0:50])] | @tsv')
+  if [ $((done_n + busy)) -eq 0 ]; then
+    # Nothing to do is usually a setup gap, not success: say where agents are.
+    local others
+    others="$(printf '%s' "$json" | jq -r '[.[] | (.provider // "?") | split("/")[0]] | group_by(.)
+      | map("\(.[0]) (\(length))") | join(", ")')"
+    echo "Paseo: no agents on provider '$provider', so none were reloaded."
+    [ -n "$others" ] && echo "  Agents are on: $others (these do not follow 'switch')."
+    echo "  Add a '$provider' provider to ~/.paseo/config.json and create/import agents on it."
+    return 0
+  fi
   echo "Paseo '$provider': reloaded $done_n idle agent(s); left $busy busy agent(s) alone."
 }
 
@@ -644,6 +656,135 @@ switch_profile() {
 }
 
 # ---------------------------------------------------------------------------
+# Quota (subscription usage limits)
+# ---------------------------------------------------------------------------
+# Reads each profile's usage the same way Claude Code's /usage does: GET
+# $QUOTA_URL with the profile's OAuth access token. Read-only: it never
+# refreshes tokens (a refresh rotates the refresh token and could log out a
+# running Claude on that profile). An expired token is reported as such; it is
+# refreshed the next time Claude runs on that profile.
+QUOTA_URL="${CLAUDE_MULTI_QUOTA_URL:-https://api.anthropic.com/api/oauth/usage}"
+
+# quota_fetch <profile> — print ONE JSON object for the profile (never fails).
+quota_fetch() {
+  local name="$1" c="$PROFILES_DIR/$1/.claude/.credentials.json" tok="" out code
+  [ -f "$c" ] && tok="$(jq -r '.claudeAiOauth.accessToken // empty' "$c" 2>/dev/null)" || true
+  if [ -z "$tok" ]; then
+    jq -n --arg p "$name" '{profile: $p, status: "logged_out",
+      error: "no OAuth token; run: claude-multi run \($p)  then /login"}'
+    return 0
+  fi
+  # Header via stdin (printf is a builtin): the token never appears in argv.
+  out="$(printf 'Authorization: Bearer %s\nanthropic-beta: oauth-2025-04-20\n' "$tok" \
+    | curl -sS -m 15 -H @- -w '\n%{http_code}' "$QUOTA_URL" 2>&1)" || true
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  case "$code" in
+    200)
+      printf '%s' "$out" | jq --arg p "$name" '
+        def win: if . == null then null else
+          { percent: .utilization, resets_at: .resets_at,
+            resets_in_s: (try ((.resets_at | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z")
+                                | fromdateiso8601) - now | floor) catch null) } end;
+        { profile: $p, status: "ok",
+          five_hour: (.five_hour | win), seven_day: (.seven_day | win),
+          limits: (.limits // []) }' 2>/dev/null \
+        || jq -n --arg p "$name" '{profile: $p, status: "error", error: "unexpected response from usage endpoint"}'
+      ;;
+    401|403)
+      jq -n --arg p "$name" '{profile: $p, status: "auth_expired",
+        error: "token expired or revoked; it refreshes the next time Claude runs on \($p) (or /login)"}' ;;
+    *)
+      jq -n --arg p "$name" --arg c "$code" --arg m "${out:0:200}" \
+        '{profile: $p, status: "error", error: "usage endpoint: HTTP \($c) \($m)"}' ;;
+  esac
+}
+
+# All initialized profiles: configured order first, then any other profile dir.
+all_profiles() {
+  local seen=" " n d
+  for n in ${CLAUDE_MULTI_PROFILES:-}; do
+    is_profile "$n" || continue
+    case "$seen" in *" $n "*) continue ;; esac
+    seen="$seen$n "; printf '%s\n' "$n"
+  done
+  for d in "$PROFILES_DIR"/*/; do
+    [ -d "$d.claude" ] || continue
+    n="$(basename "$d")"
+    case "$seen" in *" $n "*) continue ;; esac
+    seen="$seen$n "; printf '%s\n' "$n"
+  done
+}
+
+# "in 2h05m" / "in 3d4h" for a number of seconds.
+fmt_in() {
+  local s="${1:-}"
+  case "$s" in ''|null) printf '-'; return ;; esac
+  [ "$s" -le 0 ] && { printf 'now'; return; }
+  local d=$((s / 86400)) h=$((s % 86400 / 3600)) m=$((s % 3600 / 60))
+  if [ "$d" -gt 0 ]; then printf 'in %dd%dh' "$d" "$h"
+  elif [ "$h" -gt 0 ]; then printf 'in %dh%02dm' "$h" "$m"
+  else printf 'in %dm' "$m"; fi
+}
+
+# quota [profile|auto ...] [--json]
+quota_cmd() {
+  local json=0 names=() n m
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --*) die "unknown quota option: $1" ;;
+      *) names+=("$1"); shift ;;
+    esac
+  done
+  command -v curl >/dev/null 2>&1 || die "curl is required for quota."
+  command -v jq >/dev/null 2>&1 || die "jq is required for quota."
+  # Default: every profile. An auto profile expands to its members.
+  local targets=()
+  if [ ${#names[@]} -eq 0 ]; then
+    while IFS= read -r n; do [ -n "$n" ] && targets+=("$n"); done < <(all_profiles)
+  else
+    for n in "${names[@]}"; do
+      if is_auto "$n"; then
+        for m in $(auto_get "$n" profiles); do targets+=("$m"); done
+      else
+        is_profile "$n" || die "no such profile or auto profile: '$n'"
+        targets+=("$n")
+      fi
+    done
+  fi
+  [ ${#targets[@]} -gt 0 ] || die "no profiles. Run: claude-multi init <profile>"
+
+  # Which autos currently point at each profile (shown as "active: auto").
+  local a map='{}'
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    m="$(auto_resolve "$a" 2>/dev/null)" || continue
+    map="$(jq -c --arg p "$m" --arg a "$a" '.[$p] += [$a]' <<< "$map")"
+  done < <(list_autos)
+
+  local all; all="$(
+    for n in "${targets[@]}"; do quota_fetch "$n"; done \
+      | jq -s --argjson map "$map" 'map(. + {active_in: ($map[.profile] // [])})')"
+  if [ "$json" = 1 ]; then printf '%s\n' "$all"; return 0; fi
+
+  local p st f5 r5 i5 f7 r7 i7 act e
+  printf '%-12s %-6s %-26s %-6s %-26s %s\n' PROFILE 5H "5H RESETS" 7D "7D RESETS" ""
+  # \x1f separator: tab is IFS-whitespace, so read would merge empty fields.
+  while IFS=$'\x1f' read -r p st f5 r5 i5 f7 r7 i7 act e; do
+    act="${act:+active: $act}"
+    if [ "$st" != ok ]; then
+      printf '%-12s %-6s %s  %s\n' "$p" "-" "$st: $e" "$act"; continue
+    fi
+    [ -n "$r5" ] && r5="$(date -d "$r5" '+%a %H:%M' 2>/dev/null) ($(fmt_in "$i5"))"
+    [ -n "$r7" ] && r7="$(date -d "$r7" '+%a %d %b %H:%M' 2>/dev/null) ($(fmt_in "$i7"))"
+    printf '%-12s %-6s %-26s %-6s %-26s %s\n' "$p" "${f5:+$f5%}" "${r5:--}" "${f7:+$f7%}" "${r7:--}" "$act"
+  done < <(jq -r '.[] | [.profile, .status,
+      (.five_hour.percent // "" | tostring | sub("\\.0$"; "")), (.five_hour.resets_at // ""), (.five_hour.resets_in_s // ""),
+      (.seven_day.percent // "" | tostring | sub("\\.0$"; "")), (.seven_day.resets_at // ""), (.seven_day.resets_in_s // ""),
+      (.active_in | join(",")), (.error // "")] | join("\u001f")' <<< "$all")
+}
+
+# ---------------------------------------------------------------------------
 # Info / verification
 # ---------------------------------------------------------------------------
 # Print a profile's .claude directory — a self-contained CLAUDE_CONFIG_DIR that
@@ -674,7 +815,7 @@ list_profiles() {
     for d in "$PROFILES_DIR"/*/; do
       [ -d "$d" ] || continue
       name="$(basename "$d")"
-      if [ -s "$d/.claude/.credentials.json" ]; then loggedin="logged in"; else loggedin="not logged in"; fi
+      if logged_in "$name"; then loggedin="logged in"; else loggedin="not logged in"; fi
       printf '  - %-16s %s\n' "$name" "$loggedin"
     done
   else
@@ -743,8 +884,8 @@ verify() {
   check "11b. auto name may not shadow a profile"     '! ( auto_create a b )'
   check "11c. auto members must be real profiles"     '! ( auto_create x a nope )'
   check "11d. switch refuses a not-logged-in member"  '! ( switch_profile auto b --no-reload )'
-  echo '{}' > "$PROFILES_DIR/a/.claude/.credentials.json"
-  echo '{}' > "$PROFILES_DIR/b/.claude/.credentials.json"
+  echo '{"claudeAiOauth":{"refreshToken":"x"}}' > "$PROFILES_DIR/a/.claude/.credentials.json"
+  echo '{"claudeAiOauth":{"refreshToken":"x"}}' > "$PROFILES_DIR/b/.claude/.credentials.json"
   check "11e. switch <auto> <member> sets it"         'switch_profile auto b --no-reload && [ "$(auto_resolve auto)" = b ]'
   check "11f. switch (no arg) rotates b -> a"         'switch_profile --no-reload && [ "$(auto_resolve auto)" = a ]'
   check "11g. switch <member> (sole auto) works"      'switch_profile b --no-reload && [ "$(auto_resolve auto)" = b ]'
@@ -761,6 +902,12 @@ verify() {
   check "11m. run <auto> follows a switch"            \
     'CLAUDE_MULTI_BIN=bash run_profile auto -c "[ \"\$(cat ~/.claude/.claude.json)\" = PROFILE-A ] && [ ! -f ~/.claude/MARKER-B ]"'
   check "11n. several autos: switch needs a name"     'auto_create other a b && ! ( switch_profile --no-reload )'
+  echo '{"claudeAiOauth":{"accessToken":"","refreshToken":""}}' > "$PROFILES_DIR/b/.claude/.credentials.json"
+  check "12a. blank tokens count as logged out"       '! logged_in b'
+  check "12b. quota --json reports logged-out status" \
+    '[ "$(quota_cmd b --json | jq -r ".[0].status")" = logged_out ]'
+  check "12c. quota expands an auto to its members"   \
+    '[ "$(quota_cmd auto --json | jq -r "map(.profile) | join(\" \")")" = "a b" ]'
 
   rm -rf "$tmproot"
   echo
@@ -786,6 +933,8 @@ Usage:
                                                 rotate to the next logged-in one), then reload
                                                 IDLE Paseo agents on provider claude-<auto>
                                                 (when paseo is installed; --reload forces)
+  claude-multi quota [profile|auto...] [--json] Show 5h / 7d usage + reset times per profile
+                                                (all profiles by default; --json for scripts)
   claude-multi exec <profile> -- <cmd...>       Run any command in the sandbox
   claude-multi init <profile>                   Create empty profile state
   claude-multi import <profile> [opts]          Copy existing ~/.claude into a profile
@@ -812,6 +961,7 @@ main() {
     run)     run_profile "$@" ;;
     auto)    auto_cmd "$@" ;;
     switch)  switch_profile "$@" ;;
+    quota)   quota_cmd "$@" ;;
     exec)    exec_profile "$@" ;;
     init)    init_profile "${1:-}" ;;
     import)  import_profile "$@" ;;
